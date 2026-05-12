@@ -1,0 +1,48 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local runtime data
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.DS_Store
+
+# Editor and IDE files
+.idea/
+.vscode/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+.claude
