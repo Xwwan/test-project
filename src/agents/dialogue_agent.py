@@ -68,8 +68,8 @@ def generate_initial_reply(
     response = chat_once(
         messages,
         client=model_client,
+        route="dialogue.initial",
         model=model,
-        temperature=0.7,
     )
     return {
         "request_id": request_id,
@@ -101,9 +101,8 @@ def generate_followup_reply(
     response = chat_once(
         messages,
         client=model_client,
+        route="dialogue.followup",
         model=model,
-        temperature=0,
-        response_format={"type": "json_object"},
     )
 
     try:

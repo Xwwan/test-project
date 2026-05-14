@@ -225,7 +225,7 @@ def _build_default_client() -> Any:
             "or install Person 2's src/models package (currently on "
             "feature/dialogue-retrieval)."
         ) from exc
-    return build_default_client()
+    return build_default_client(route="memory.curator")
 
 
 def _normalize_payload(raw: Any) -> dict:

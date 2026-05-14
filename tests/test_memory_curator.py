@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import unittest
+from unittest.mock import patch
 
 from src.agents.memory_curator import (
     LLMMemoryExtractor,
@@ -338,11 +339,12 @@ class MemoryCuratorTest(unittest.TestCase):
         raise a clear configuration error instead of silently doing nothing.
         """
 
-        with self.assertRaises(ValueError):
-            extract_memory_operations(
-                conversation_id="conv-1",
-                turns=CONVERSATION_TURNS,
-            )
+        with patch("src.models.chat.get_config_value", return_value=None):
+            with self.assertRaises(ValueError):
+                extract_memory_operations(
+                    conversation_id="conv-1",
+                    turns=CONVERSATION_TURNS,
+                )
 
 
     # ---------------------------------------------------------------------------

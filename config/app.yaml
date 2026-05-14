@@ -1,0 +1,54 @@
+providers:
+  openai_default:
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    timeout_seconds: 60
+
+  anthropic_default:
+    type: anthropic
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    anthropic_version: "2023-06-01"
+    timeout_seconds: 60
+
+  local_openai_compatible:
+    type: openai-compatible
+    base_url: http://localhost:12345/v1
+    api_key_env: OPENAI_API_KEY
+    api_key_fallback: not-needed
+    timeout_seconds: 60
+
+routes:
+  default:
+    default:
+      provider: openai_default
+      model: gpt-5.5
+
+  dialogue:
+    initial:
+      provider: openai_default
+      model: gpt-5.5
+      temperature: 0.7
+
+    followup:
+      provider: openai_default
+      model: gpt-5.5
+      temperature: 0.0
+      response_format:
+        type: json_object
+
+  memory:
+    retrieval:
+      provider: openai_default
+      model: gpt-5.5
+      temperature: 0.0
+      response_format:
+        type: json_object
+
+    curator:
+      provider: openai_default
+      model: gpt-5.5
+      temperature: 0.0
+      response_format:
+        type: json_object

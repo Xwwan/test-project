@@ -68,9 +68,8 @@ def retrieve_relevant_memory_ids(
     response = chat_once(
         messages,
         client=model_client,
+        route="memory.retrieval",
         model=model,
-        temperature=0,
-        response_format={"type": "json_object"},
     )
 
     try:
