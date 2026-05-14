@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import signal
 import sys
 from contextlib import suppress
 
@@ -55,15 +54,10 @@ def main(argv: list[str] | None = None) -> int:
     server = build_app(args.host, args.port, dependencies=build_dependencies())
     logger.info("listening on http://%s:%d", args.host, args.port)
 
-    def _stop(*_: object) -> None:
-        logger.info("shutdown requested")
-        server.shutdown()
-
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
-
     try:
         server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("shutdown requested")
     finally:
         with suppress(Exception):
             server.server_close()
