@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
+import unittest
 
 from src.api.routes import dispatch
 from src.coordinator import request_coordinator
@@ -103,145 +103,145 @@ def _build_dependencies(
     return deps, convo, memory
 
 
-@pytest.fixture(autouse=True)
-def _reset() -> None:
-    request_coordinator.reset_store()
-    yield
-    request_coordinator.reset_store()
+class ApiRoutesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        request_coordinator.reset_store()
+
+    def tearDown(self) -> None:
+        request_coordinator.reset_store()
+
+    def test_post_chat_returns_200_with_chat_response(self) -> None:
+        deps, _, _ = _build_dependencies(initial_reply="你好，小明！")
+        status, body = dispatch(
+            "POST",
+            "/chat",
+            {"conversation_id": "conv-1", "message": "你好"},
+            dependencies=deps,
+        )
+        assert status == 200
+        assert body["reply"] == "你好，小明！"
+        assert body["conversation_id"] == "conv-1"
+        assert body["request_id"].startswith("req_")
+        assert body["retrieval_status"] == "completed"
 
 
-def test_post_chat_returns_200_with_chat_response() -> None:
-    deps, _, _ = _build_dependencies(initial_reply="你好，小明！")
-    status, body = dispatch(
-        "POST",
-        "/chat",
-        {"conversation_id": "conv-1", "message": "你好"},
-        dependencies=deps,
-    )
-    assert status == 200
-    assert body["reply"] == "你好，小明！"
-    assert body["conversation_id"] == "conv-1"
-    assert body["request_id"].startswith("req_")
-    assert body["retrieval_status"] == "completed"
+    def test_post_chat_validates_body(self) -> None:
+        deps, _, _ = _build_dependencies()
+        status, body = dispatch("POST", "/chat", {}, dependencies=deps)
+        assert status == 400
+        assert "conversation_id" in body["error"]["message"]
 
 
-def test_post_chat_validates_body() -> None:
-    deps, _, _ = _build_dependencies()
-    status, body = dispatch("POST", "/chat", {}, dependencies=deps)
-    assert status == 400
-    assert "conversation_id" in body["error"]["message"]
+    def test_get_pending_followups_lists_retrieval_completed_requests(self) -> None:
+        memory = FakeMemoryStore(lightweight=[{"id": 1, "summary": "x"}])
+        deps, _, _ = _build_dependencies(memory_store=memory, selected_ids=[1])
+
+        chat_status, chat_body = dispatch(
+            "POST",
+            "/chat",
+            {"conversation_id": "conv-1", "message": "你好"},
+            dependencies=deps,
+        )
+        assert chat_status == 200
+
+        status, body = dispatch("GET", "/followups/pending", dependencies=deps)
+        assert status == 200
+        assert len(body["pending"]) == 1
+        assert body["pending"][0]["request_id"] == chat_body["request_id"]
 
 
-def test_get_pending_followups_lists_retrieval_completed_requests() -> None:
-    memory = FakeMemoryStore(lightweight=[{"id": 1, "summary": "x"}])
-    deps, _, _ = _build_dependencies(memory_store=memory, selected_ids=[1])
+    def test_followup_run_returns_decision_and_clears_pending(self) -> None:
+        memory = FakeMemoryStore(lightweight=[{"id": 1, "summary": "x"}])
+        deps, _, _ = _build_dependencies(
+            memory_store=memory,
+            selected_ids=[1],
+            followup={
+                "decision": "followup",
+                "followup_type": "supplement",
+                "reply": "顺便补充：你之前提过这个。",
+            },
+        )
 
-    chat_status, chat_body = dispatch(
-        "POST",
-        "/chat",
-        {"conversation_id": "conv-1", "message": "你好"},
-        dependencies=deps,
-    )
-    assert chat_status == 200
+        _, chat_body = dispatch(
+            "POST",
+            "/chat",
+            {"conversation_id": "conv-1", "message": "记得吗？"},
+            dependencies=deps,
+        )
 
-    status, body = dispatch("GET", "/followups/pending", dependencies=deps)
-    assert status == 200
-    assert len(body["pending"]) == 1
-    assert body["pending"][0]["request_id"] == chat_body["request_id"]
+        status, body = dispatch(
+            "POST",
+            f"/followups/{chat_body['request_id']}/run",
+            None,
+            dependencies=deps,
+        )
+        assert status == 200
+        assert body["decision"] == "followup"
+        assert body["reply"].startswith("顺便补充")
 
-
-def test_followup_run_returns_decision_and_clears_pending() -> None:
-    memory = FakeMemoryStore(lightweight=[{"id": 1, "summary": "x"}])
-    deps, _, _ = _build_dependencies(
-        memory_store=memory,
-        selected_ids=[1],
-        followup={
-            "decision": "followup",
-            "followup_type": "supplement",
-            "reply": "顺便补充：你之前提过这个。",
-        },
-    )
-
-    _, chat_body = dispatch(
-        "POST",
-        "/chat",
-        {"conversation_id": "conv-1", "message": "记得吗？"},
-        dependencies=deps,
-    )
-
-    status, body = dispatch(
-        "POST",
-        f"/followups/{chat_body['request_id']}/run",
-        None,
-        dependencies=deps,
-    )
-    assert status == 200
-    assert body["decision"] == "followup"
-    assert body["reply"].startswith("顺便补充")
-
-    _, pending = dispatch("GET", "/followups/pending", dependencies=deps)
-    assert pending["pending"] == []
+        _, pending = dispatch("GET", "/followups/pending", dependencies=deps)
+        assert pending["pending"] == []
 
 
-def test_followup_run_returns_404_for_unknown_request() -> None:
-    deps, _, _ = _build_dependencies()
-    status, body = dispatch(
-        "POST", "/followups/req_unknown/run", None, dependencies=deps
-    )
-    assert status == 404
-    assert "unknown" in body["error"]["message"].lower()
+    def test_followup_run_returns_404_for_unknown_request(self) -> None:
+        deps, _, _ = _build_dependencies()
+        status, body = dispatch(
+            "POST", "/followups/req_unknown/run", None, dependencies=deps
+        )
+        assert status == 404
+        assert "unknown" in body["error"]["message"].lower()
 
 
-def test_memory_curate_returns_operations_and_applies_them() -> None:
-    operations = [
-        {
-            "operation": "create",
-            "target_id": None,
-            "payload": {"summary": "用户喜欢喝茶", "content": "..."},
-        }
-    ]
-    deps, convo, memory = _build_dependencies(operations=operations)
-    convo.append_turn("conv-1", {"turn_id": "t1", "role": "user", "content": "记住"})
+    def test_memory_curate_returns_operations_and_applies_them(self) -> None:
+        operations = [
+            {
+                "operation": "create",
+                "target_id": None,
+                "payload": {"summary": "用户喜欢喝茶", "content": "..."},
+            }
+        ]
+        deps, convo, memory = _build_dependencies(operations=operations)
+        convo.append_turn("conv-1", {"turn_id": "t1", "role": "user", "content": "记住"})
 
-    status, body = dispatch(
-        "POST",
-        "/memory/curate",
-        {"conversation_id": "conv-1"},
-        dependencies=deps,
-    )
-    assert status == 200
-    assert body["conversation_id"] == "conv-1"
-    assert body["operations"] == operations
-    assert memory.applied == [operations]
-
-
-def test_memory_profile_refresh_returns_consolidator_decision() -> None:
-    deps, _, _ = _build_dependencies(
-        consolidator={
-            "should_update": True,
-            "patch": {"operation": "replace", "content": "# Profile"},
-            "reason": "fake",
-        }
-    )
-    status, body = dispatch("POST", "/memory/profile/refresh", None, dependencies=deps)
-    assert status == 200
-    assert body["should_update"] is True
-    assert body["new_profile"] == "# Profile"
+        status, body = dispatch(
+            "POST",
+            "/memory/curate",
+            {"conversation_id": "conv-1"},
+            dependencies=deps,
+        )
+        assert status == 200
+        assert body["conversation_id"] == "conv-1"
+        assert body["operations"] == operations
+        assert memory.applied == [operations]
 
 
-def test_healthz_returns_ok() -> None:
-    status, body = dispatch("GET", "/healthz")
-    assert status == 200
-    assert body == {"status": "ok"}
+    def test_memory_profile_refresh_returns_consolidator_decision(self) -> None:
+        deps, _, _ = _build_dependencies(
+            consolidator={
+                "should_update": True,
+                "patch": {"operation": "replace", "content": "# Profile"},
+                "reason": "fake",
+            }
+        )
+        status, body = dispatch("POST", "/memory/profile/refresh", None, dependencies=deps)
+        assert status == 200
+        assert body["should_update"] is True
+        assert body["new_profile"] == "# Profile"
 
 
-def test_unknown_route_returns_404() -> None:
-    status, body = dispatch("GET", "/does-not-exist")
-    assert status == 404
-    assert "no route" in body["error"]["message"]
+    def test_healthz_returns_ok(self) -> None:
+        status, body = dispatch("GET", "/healthz")
+        assert status == 200
+        assert body == {"status": "ok"}
 
 
-def test_invalid_method_returns_404() -> None:
-    deps, _, _ = _build_dependencies()
-    status, body = dispatch("PUT", "/chat", {}, dependencies=deps)
-    assert status == 404
+    def test_unknown_route_returns_404(self) -> None:
+        status, body = dispatch("GET", "/does-not-exist")
+        assert status == 404
+        assert "no route" in body["error"]["message"]
+
+
+    def test_invalid_method_returns_404(self) -> None:
+        deps, _, _ = _build_dependencies()
+        status, body = dispatch("PUT", "/chat", {}, dependencies=deps)
+        assert status == 404

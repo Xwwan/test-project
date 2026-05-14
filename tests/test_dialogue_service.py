@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
+import unittest
 
 from src.coordinator import request_coordinator
 from src.services import (
@@ -117,13 +117,6 @@ class RecordingFollowupFn:
         return {"request_id": input_data["request_id"], **self.decision}
 
 
-@pytest.fixture(autouse=True)
-def _reset_coordinator() -> None:
-    request_coordinator.reset_store()
-    yield
-    request_coordinator.reset_store()
-
-
 def _build_deps(
     *,
     persona: FakePersona | None = None,
@@ -179,268 +172,275 @@ def _build_deps(
 # ---------------------------------------------------------------------------
 
 
-def test_handle_chat_message_returns_first_reply_and_binds_ids() -> None:
-    initial = RecordingInitialReplyFn(reply="你好，小明！")
-    deps = _build_deps(initial_reply_fn=initial)
+class DialogueServiceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        request_coordinator.reset_store()
 
-    response = handle_chat_message("conv-1", "你好", dependencies=deps)
+    def tearDown(self) -> None:
+        request_coordinator.reset_store()
 
-    assert response["conversation_id"] == "conv-1"
-    assert response["reply"] == "你好，小明！"
-    assert response["retrieval_status"] == "completed"
-    assert response["request_id"].startswith("req_")
-    assert response["turn_id"].startswith("turn_")
-    assert response["retrieved_memory_ids"] == []
+    def test_handle_chat_message_returns_first_reply_and_binds_ids(self) -> None:
+        initial = RecordingInitialReplyFn(reply="你好，小明！")
+        deps = _build_deps(initial_reply_fn=initial)
 
-    final_record = request_coordinator.get_request(response["request_id"])
-    assert final_record["status"] == "retrieval_completed"
-    assert final_record["initial_reply"] == "你好，小明！"
-    assert final_record["retrieved_items"] == []
+        response = handle_chat_message("conv-1", "你好", dependencies=deps)
 
-    assert initial.last_input is not None
-    assert initial.last_input["request_id"] == response["request_id"]
-    assert initial.last_input["current_query"] == "你好"
+        assert response["conversation_id"] == "conv-1"
+        assert response["reply"] == "你好，小明！"
+        assert response["retrieval_status"] == "completed"
+        assert response["request_id"].startswith("req_")
+        assert response["turn_id"].startswith("turn_")
+        assert response["retrieved_memory_ids"] == []
 
+        final_record = request_coordinator.get_request(response["request_id"])
+        assert final_record["status"] == "retrieval_completed"
+        assert final_record["initial_reply"] == "你好，小明！"
+        assert final_record["retrieved_items"] == []
 
-def test_handle_chat_message_saves_user_and_assistant_turns() -> None:
-    convo = FakeConversationStore()
-    deps = _build_deps(conversation_store=convo)
-
-    response = handle_chat_message("conv-1", "你好", dependencies=deps)
-
-    assert [turn["role"] for cid, turn in convo.turns] == ["user", "assistant"]
-    user_turn = convo.turns[0][1]
-    assistant_turn = convo.turns[1][1]
-    assert user_turn["turn_id"] == response["turn_id"]
-    assert user_turn["content"] == "你好"
-    assert assistant_turn["content"] == response["reply"]
-    assert assistant_turn["metadata_json"]["turn_kind"] == "initial"
+        assert initial.last_input is not None
+        assert initial.last_input["request_id"] == response["request_id"]
+        assert initial.last_input["current_query"] == "你好"
 
 
-def test_handle_chat_message_runs_retrieval_when_lightweight_items_exist() -> None:
-    memory = FakeMemoryStore(
-        lightweight=[
-            {"id": 1, "summary": "用户喜欢喝绿茶", "memory_type": "preference"},
-            {"id": 2, "summary": "用户对花生过敏", "memory_type": "constraint"},
-        ]
-    )
-    retrieval = RecordingRetrievalFn(selected_ids=[2])
-    deps = _build_deps(memory_store=memory, retrieval_fn=retrieval)
+    def test_handle_chat_message_saves_user_and_assistant_turns(self) -> None:
+        convo = FakeConversationStore()
+        deps = _build_deps(conversation_store=convo)
 
-    response = handle_chat_message("conv-1", "今天可以吃花生酱吗？", dependencies=deps)
+        response = handle_chat_message("conv-1", "你好", dependencies=deps)
 
-    assert response["retrieved_memory_ids"] == [2]
-    assert retrieval.last_kwargs is not None
-    assert retrieval.last_kwargs["current_query"] == "今天可以吃花生酱吗？"
-    # The lightweight payload from Person 1 is forwarded to Person 2.
-    assert [item["id"] for item in retrieval.last_kwargs["lightweight_memory_items"]] == [1, 2]
+        assert [turn["role"] for cid, turn in convo.turns] == ["user", "assistant"]
+        user_turn = convo.turns[0][1]
+        assistant_turn = convo.turns[1][1]
+        assert user_turn["turn_id"] == response["turn_id"]
+        assert user_turn["content"] == "你好"
+        assert assistant_turn["content"] == response["reply"]
+        assert assistant_turn["metadata_json"]["turn_kind"] == "initial"
 
 
-def test_handle_chat_message_marks_failed_when_initial_reply_raises() -> None:
-    def failing_initial(input_data: dict, *, model_client: Any = None, **kwargs: Any) -> dict:
-        raise RuntimeError("model unavailable")
-
-    deps = _build_deps(initial_reply_fn=failing_initial)
-
-    with pytest.raises(RuntimeError):
-        handle_chat_message("conv-1", "你好", dependencies=deps)
-
-    all_requests = request_coordinator.list_requests()
-    assert len(all_requests) == 1
-    failed = all_requests[0]
-    assert failed["status"] == "failed"
-    assert "model unavailable" in (failed["error"] or "")
-
-
-def test_handle_chat_message_rejects_empty_inputs() -> None:
-    deps = _build_deps()
-    with pytest.raises(ValueError):
-        handle_chat_message("", "hello", dependencies=deps)
-    with pytest.raises(ValueError):
-        handle_chat_message("conv-1", "", dependencies=deps)
-
-
-# ---------------------------------------------------------------------------
-# handle_followup
-# ---------------------------------------------------------------------------
-
-
-def test_handle_followup_returns_no_followup_when_no_retrieved_items() -> None:
-    deps = _build_deps()
-    chat_response = handle_chat_message("conv-1", "你好", dependencies=deps)
-
-    decision = handle_followup(chat_response["request_id"], dependencies=deps)
-    assert decision["decision"] == "no_followup"
-    assert decision["reply"] == ""
-
-    record = request_coordinator.get_request(chat_response["request_id"])
-    assert record["status"] == "no_followup_needed"
-
-
-def test_handle_followup_saves_assistant_turn_when_followup_decision_returned() -> None:
-    convo = FakeConversationStore()
-    memory = FakeMemoryStore(
-        lightweight=[{"id": 9, "summary": "用户对花生过敏", "memory_type": "constraint"}]
-    )
-    retrieval = RecordingRetrievalFn(selected_ids=[9])
-    followup = RecordingFollowupFn(
-        {
-            "decision": "followup",
-            "followup_type": "correction",
-            "reply": "提醒一下，你之前告诉我对花生过敏。",
-        }
-    )
-    deps = _build_deps(
-        conversation_store=convo,
-        memory_store=memory,
-        retrieval_fn=retrieval,
-        followup_fn=followup,
-    )
-
-    chat_response = handle_chat_message("conv-1", "今天吃花生酱吗？", dependencies=deps)
-    decision = handle_followup(chat_response["request_id"], dependencies=deps)
-
-    assert decision["decision"] == "followup"
-    assert decision["followup_type"] == "correction"
-    assistant_turns = [turn for cid, turn in convo.turns if turn["role"] == "assistant"]
-    assert assistant_turns[-1]["content"] == decision["reply"]
-    assert assistant_turns[-1]["metadata_json"]["turn_kind"] == "followup"
-
-    record = request_coordinator.get_request(chat_response["request_id"])
-    assert record["status"] == "followup_generated"
-
-
-def test_handle_followup_normalizes_decision_with_empty_reply_to_no_followup() -> None:
-    memory = FakeMemoryStore(
-        lightweight=[{"id": 1, "summary": "用户喜欢喝绿茶", "memory_type": "preference"}]
-    )
-    retrieval = RecordingRetrievalFn(selected_ids=[1])
-    followup = RecordingFollowupFn(
-        {"decision": "followup", "followup_type": "supplement", "reply": "   "}
-    )
-    deps = _build_deps(memory_store=memory, retrieval_fn=retrieval, followup_fn=followup)
-
-    chat_response = handle_chat_message("conv-1", "推荐一种饮料", dependencies=deps)
-    decision = handle_followup(chat_response["request_id"], dependencies=deps)
-
-    assert decision["decision"] == "no_followup"
-    assert decision["followup_type"] == "none"
-    assert decision["reply"] == ""
-
-
-def test_handle_followup_validates_request_state() -> None:
-    deps = _build_deps()
-    created = request_coordinator.create_request("conv-1", "hi")
-    with pytest.raises(request_coordinator.RequestStateError):
-        handle_followup(created["request_id"], dependencies=deps)
-
-
-# ---------------------------------------------------------------------------
-# Memory Service
-# ---------------------------------------------------------------------------
-
-
-def test_apply_operations_forwards_to_memory_store() -> None:
-    memory = FakeMemoryStore()
-    deps = _build_deps(memory_store=memory)
-    operations = [
-        {
-            "operation": "create",
-            "target_id": None,
-            "payload": {"summary": "用户喜欢喝茶", "content": "..."},
-        }
-    ]
-    apply_operations(operations, dependencies=deps)
-    assert memory.applied_operations == [operations]
-
-
-def test_curate_conversation_memory_reads_history_and_applies_operations() -> None:
-    convo = FakeConversationStore()
-    memory = FakeMemoryStore()
-    persona = FakePersona()
-    # Seed a couple of turns
-    convo.append_turn("conv-1", {"turn_id": "t1", "role": "user", "content": "记住我叫小明"})
-    convo.append_turn(
-        "conv-1",
-        {"turn_id": "t2", "role": "assistant", "content": "记下了"},
-    )
-
-    captured: dict = {}
-
-    def extract_fn(**kwargs):
-        captured.update(kwargs)
-        return {
-            "operations": [
-                {
-                    "operation": "create",
-                    "target_id": None,
-                    "payload": {
-                        "summary": "用户名字：小明",
-                        "content": "用户自我介绍。",
-                        "memory_type": "profile_update",
-                    },
-                }
+    def test_handle_chat_message_runs_retrieval_when_lightweight_items_exist(self) -> None:
+        memory = FakeMemoryStore(
+            lightweight=[
+                {"id": 1, "summary": "用户喜欢喝绿茶", "memory_type": "preference"},
+                {"id": 2, "summary": "用户对花生过敏", "memory_type": "constraint"},
             ]
-        }
+        )
+        retrieval = RecordingRetrievalFn(selected_ids=[2])
+        deps = _build_deps(memory_store=memory, retrieval_fn=retrieval)
 
-    deps = _build_deps(
-        persona=persona,
-        conversation_store=convo,
-        memory_store=memory,
-        extract_fn=extract_fn,
-    )
+        response = handle_chat_message("conv-1", "今天可以吃花生酱吗？", dependencies=deps)
 
-    result = curate_conversation_memory(
-        "conv-1", dependencies=deps, model_client="dummy-client"
-    )
-
-    assert result["conversation_id"] == "conv-1"
-    assert [op["operation"] for op in result["operations"]] == ["create"]
-    assert memory.applied_operations[0] == result["operations"]
-
-    # The curator received the conversation turns and was given the dummy client.
-    assert captured["conversation_id"] == "conv-1"
-    assert [t["turn_id"] for t in captured["turns"]] == ["t1", "t2"]
-    assert captured["model_client"] == "dummy-client"
+        assert response["retrieved_memory_ids"] == [2]
+        assert retrieval.last_kwargs is not None
+        assert retrieval.last_kwargs["current_query"] == "今天可以吃花生酱吗？"
+        # The lightweight payload from Person 1 is forwarded to Person 2.
+        assert [item["id"] for item in retrieval.last_kwargs["lightweight_memory_items"]] == [1, 2]
 
 
-def test_refresh_user_profile_writes_when_consolidator_recommends_update() -> None:
-    persona = FakePersona(user_profile="")
-    memory = FakeMemoryStore(
-        lightweight=[
+    def test_handle_chat_message_marks_failed_when_initial_reply_raises(self) -> None:
+        def failing_initial(input_data: dict, *, model_client: Any = None, **kwargs: Any) -> dict:
+            raise RuntimeError("model unavailable")
+
+        deps = _build_deps(initial_reply_fn=failing_initial)
+
+        with self.assertRaises(RuntimeError):
+            handle_chat_message("conv-1", "你好", dependencies=deps)
+
+        all_requests = request_coordinator.list_requests()
+        assert len(all_requests) == 1
+        failed = all_requests[0]
+        assert failed["status"] == "failed"
+        assert "model unavailable" in (failed["error"] or "")
+
+
+    def test_handle_chat_message_rejects_empty_inputs(self) -> None:
+        deps = _build_deps()
+        with self.assertRaises(ValueError):
+            handle_chat_message("", "hello", dependencies=deps)
+        with self.assertRaises(ValueError):
+            handle_chat_message("conv-1", "", dependencies=deps)
+
+
+    # ---------------------------------------------------------------------------
+    # handle_followup
+    # ---------------------------------------------------------------------------
+
+
+    def test_handle_followup_returns_no_followup_when_no_retrieved_items(self) -> None:
+        deps = _build_deps()
+        chat_response = handle_chat_message("conv-1", "你好", dependencies=deps)
+
+        decision = handle_followup(chat_response["request_id"], dependencies=deps)
+        assert decision["decision"] == "no_followup"
+        assert decision["reply"] == ""
+
+        record = request_coordinator.get_request(chat_response["request_id"])
+        assert record["status"] == "no_followup_needed"
+
+
+    def test_handle_followup_saves_assistant_turn_when_followup_decision_returned(self) -> None:
+        convo = FakeConversationStore()
+        memory = FakeMemoryStore(
+            lightweight=[{"id": 9, "summary": "用户对花生过敏", "memory_type": "constraint"}]
+        )
+        retrieval = RecordingRetrievalFn(selected_ids=[9])
+        followup = RecordingFollowupFn(
             {
-                "id": 1,
-                "summary": "用户名字：小明",
-                "memory_type": "profile_update",
-                "importance": 0.9,
-                "confidence": 0.9,
-                "status": "active",
+                "decision": "followup",
+                "followup_type": "correction",
+                "reply": "提醒一下，你之前告诉我对花生过敏。",
+            }
+        )
+        deps = _build_deps(
+            conversation_store=convo,
+            memory_store=memory,
+            retrieval_fn=retrieval,
+            followup_fn=followup,
+        )
+
+        chat_response = handle_chat_message("conv-1", "今天吃花生酱吗？", dependencies=deps)
+        decision = handle_followup(chat_response["request_id"], dependencies=deps)
+
+        assert decision["decision"] == "followup"
+        assert decision["followup_type"] == "correction"
+        assistant_turns = [turn for cid, turn in convo.turns if turn["role"] == "assistant"]
+        assert assistant_turns[-1]["content"] == decision["reply"]
+        assert assistant_turns[-1]["metadata_json"]["turn_kind"] == "followup"
+
+        record = request_coordinator.get_request(chat_response["request_id"])
+        assert record["status"] == "followup_generated"
+
+
+    def test_handle_followup_normalizes_decision_with_empty_reply_to_no_followup(self) -> None:
+        memory = FakeMemoryStore(
+            lightweight=[{"id": 1, "summary": "用户喜欢喝绿茶", "memory_type": "preference"}]
+        )
+        retrieval = RecordingRetrievalFn(selected_ids=[1])
+        followup = RecordingFollowupFn(
+            {"decision": "followup", "followup_type": "supplement", "reply": "   "}
+        )
+        deps = _build_deps(memory_store=memory, retrieval_fn=retrieval, followup_fn=followup)
+
+        chat_response = handle_chat_message("conv-1", "推荐一种饮料", dependencies=deps)
+        decision = handle_followup(chat_response["request_id"], dependencies=deps)
+
+        assert decision["decision"] == "no_followup"
+        assert decision["followup_type"] == "none"
+        assert decision["reply"] == ""
+
+
+    def test_handle_followup_validates_request_state(self) -> None:
+        deps = _build_deps()
+        created = request_coordinator.create_request("conv-1", "hi")
+        with self.assertRaises(request_coordinator.RequestStateError):
+            handle_followup(created["request_id"], dependencies=deps)
+
+
+    # ---------------------------------------------------------------------------
+    # Memory Service
+    # ---------------------------------------------------------------------------
+
+
+    def test_apply_operations_forwards_to_memory_store(self) -> None:
+        memory = FakeMemoryStore()
+        deps = _build_deps(memory_store=memory)
+        operations = [
+            {
+                "operation": "create",
+                "target_id": None,
+                "payload": {"summary": "用户喜欢喝茶", "content": "..."},
             }
         ]
-    )
-
-    def consolidator_fn(items, current, **kwargs):
-        assert items[0]["summary"] == "用户名字：小明"
-        return {
-            "should_update": True,
-            "patch": {"operation": "replace", "content": "# User\n- 名字：小明\n"},
-            "reason": "fake",
-        }
-
-    deps = _build_deps(persona=persona, memory_store=memory, consolidator_fn=consolidator_fn)
-
-    result = refresh_user_profile(dependencies=deps)
-    assert result["should_update"] is True
-    assert result["new_profile"].startswith("# User")
-    assert persona.applied_patches == [{"operation": "replace", "content": "# User\n- 名字：小明\n"}]
+        apply_operations(operations, dependencies=deps)
+        assert memory.applied_operations == [operations]
 
 
-def test_refresh_user_profile_returns_without_writing_when_no_update_needed() -> None:
-    persona = FakePersona(user_profile="existing")
-    memory = FakeMemoryStore(lightweight=[])
-    deps = _build_deps(persona=persona, memory_store=memory)
+    def test_curate_conversation_memory_reads_history_and_applies_operations(self) -> None:
+        convo = FakeConversationStore()
+        memory = FakeMemoryStore()
+        persona = FakePersona()
+        # Seed a couple of turns
+        convo.append_turn("conv-1", {"turn_id": "t1", "role": "user", "content": "记住我叫小明"})
+        convo.append_turn(
+            "conv-1",
+            {"turn_id": "t2", "role": "assistant", "content": "记下了"},
+        )
 
-    result = refresh_user_profile(dependencies=deps)
-    assert result["should_update"] is False
-    assert result["new_profile"] is None
-    assert persona.applied_patches == []
+        captured: dict = {}
+
+        def extract_fn(**kwargs):
+            captured.update(kwargs)
+            return {
+                "operations": [
+                    {
+                        "operation": "create",
+                        "target_id": None,
+                        "payload": {
+                            "summary": "用户名字：小明",
+                            "content": "用户自我介绍。",
+                            "memory_type": "profile_update",
+                        },
+                    }
+                ]
+            }
+
+        deps = _build_deps(
+            persona=persona,
+            conversation_store=convo,
+            memory_store=memory,
+            extract_fn=extract_fn,
+        )
+
+        result = curate_conversation_memory(
+            "conv-1", dependencies=deps, model_client="dummy-client"
+        )
+
+        assert result["conversation_id"] == "conv-1"
+        assert [op["operation"] for op in result["operations"]] == ["create"]
+        assert memory.applied_operations[0] == result["operations"]
+
+        # The curator received the conversation turns and was given the dummy client.
+        assert captured["conversation_id"] == "conv-1"
+        assert [t["turn_id"] for t in captured["turns"]] == ["t1", "t2"]
+        assert captured["model_client"] == "dummy-client"
+
+
+    def test_refresh_user_profile_writes_when_consolidator_recommends_update(self) -> None:
+        persona = FakePersona(user_profile="")
+        memory = FakeMemoryStore(
+            lightweight=[
+                {
+                    "id": 1,
+                    "summary": "用户名字：小明",
+                    "memory_type": "profile_update",
+                    "importance": 0.9,
+                    "confidence": 0.9,
+                    "status": "active",
+                }
+            ]
+        )
+
+        def consolidator_fn(items, current, **kwargs):
+            assert items[0]["summary"] == "用户名字：小明"
+            return {
+                "should_update": True,
+                "patch": {"operation": "replace", "content": "# User\n- 名字：小明\n"},
+                "reason": "fake",
+            }
+
+        deps = _build_deps(persona=persona, memory_store=memory, consolidator_fn=consolidator_fn)
+
+        result = refresh_user_profile(dependencies=deps)
+        assert result["should_update"] is True
+        assert result["new_profile"].startswith("# User")
+        assert persona.applied_patches == [{"operation": "replace", "content": "# User\n- 名字：小明\n"}]
+
+
+    def test_refresh_user_profile_returns_without_writing_when_no_update_needed(self) -> None:
+        persona = FakePersona(user_profile="existing")
+        memory = FakeMemoryStore(lightweight=[])
+        deps = _build_deps(persona=persona, memory_store=memory)
+
+        result = refresh_user_profile(dependencies=deps)
+        assert result["should_update"] is False
+        assert result["new_profile"] is None
+        assert persona.applied_patches == []
