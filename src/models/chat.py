@@ -208,11 +208,12 @@ class OpenAIResponsesClient:
         self.default_model = default_model
         self.timeout = timeout
 
-    def chat(self, messages: list[ChatMessage], **kwargs: Any) -> ChatResponse:
+    def chat(self, messages: list[ChatMessage | dict], **kwargs: Any) -> ChatResponse:
+        normalized = [_coerce_message(message) for message in messages]
         model = kwargs.get("model") or self.default_model
         payload: dict[str, Any] = {
             "model": model,
-            "input": [message.to_dict() for message in messages],
+            "input": [message.to_dict() for message in normalized],
         }
 
         _copy_if_present(kwargs, payload, "temperature")
@@ -260,11 +261,12 @@ class OpenAIChatCompletionsClient:
         self.default_model = default_model
         self.timeout = timeout
 
-    def chat(self, messages: list[ChatMessage], **kwargs: Any) -> ChatResponse:
+    def chat(self, messages: list[ChatMessage | dict], **kwargs: Any) -> ChatResponse:
+        normalized = [_coerce_message(message) for message in messages]
         model = kwargs.get("model") or self.default_model
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [message.to_dict() for message in messages],
+            "messages": [message.to_dict() for message in normalized],
         }
 
         _copy_if_present(kwargs, payload, "temperature")
@@ -309,9 +311,10 @@ class AnthropicMessagesClient:
         self.timeout = timeout
         self.anthropic_version = anthropic_version
 
-    def chat(self, messages: list[ChatMessage], **kwargs: Any) -> ChatResponse:
+    def chat(self, messages: list[ChatMessage | dict], **kwargs: Any) -> ChatResponse:
+        normalized = [_coerce_message(message) for message in messages]
         model = kwargs.get("model") or self.default_model
-        system_text, anthropic_messages = _split_anthropic_messages(messages)
+        system_text, anthropic_messages = _split_anthropic_messages(normalized)
 
         payload: dict[str, Any] = {
             "model": model,

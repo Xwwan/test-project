@@ -244,6 +244,28 @@ routes:
         )
         self.assertEqual(captured["headers"]["Authorization"], "Bearer key")
 
+    def test_provider_clients_accept_dict_messages(self):
+        captured = {}
+
+        def fake_post_json(url, payload, *, headers, timeout):
+            captured.update({"url": url, "payload": payload})
+            return {"choices": [{"message": {"content": "ok"}}], "model": payload["model"]}
+
+        client = OpenAIChatCompletionsClient(
+            api_key="key",
+            base_url="https://api.example/v1",
+        )
+
+        with patch("src.models.chat._post_json", fake_post_json):
+            response = client.chat([{"role": "user", "content": "Return JSON"}])
+
+        self.assertEqual(response.content, "ok")
+        self.assertEqual(captured["url"], "https://api.example/v1/chat/completions")
+        self.assertEqual(
+            captured["payload"]["messages"],
+            [{"role": "user", "content": "Return JSON"}],
+        )
+
     def test_anthropic_client_splits_system_prompt_and_uses_latest_default_model(self):
         captured = {}
 
