@@ -64,6 +64,15 @@ routes:
 YUNWU_API_KEY=你的真实 key
 ```
 
+语音输入/输出的 API key 也放在同一个 `.env`：
+
+```env
+VOLCENGINE_APP_ID=你的火山引擎 App ID
+VOLCENGINE_ACCESS_KEY=你的火山引擎 Access Key
+VOLCENGINE_RESOURCE_ID=你的火山引擎 ASR Resource ID
+DASHSCOPE_API_KEY=你的 DashScope API Key
+```
+
 如果使用本地 OpenAI-compatible 服务，可以把 route 的 `provider` 改成 `local_openai_compatible`，并按实际服务修改 `base_url` 和 `model`。
 
 ## 测试
@@ -109,6 +118,21 @@ curl -s -X POST http://127.0.0.1:8000/chat \
   }'
 ```
 
+发送语音聊天消息，`audio_base64` 当前约定为 16kHz、16-bit、mono PCM 的 base64：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/voice/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "conversation_id": "conv-demo-voice-001",
+    "audio_base64": "把PCM音频转成base64后放这里",
+    "audio_format": "pcm",
+    "tts_enabled": true
+  }'
+```
+
+返回里会包含 `transcript`、模型 `reply`，以及开启 TTS 时的 `audio_base64` PCM 音频。
+
 查询待处理 followup：
 
 ```bash
@@ -151,6 +175,7 @@ src/agents/             Dialogue Agent、Retrieval、Curator、Profile Consolida
 src/api/                HTTP route 和 schema
 src/conversation/       对话历史和 compact history
 src/coordinator/        request 生命周期和 pending followup 队列
+src/audio/              STT/TTS 适配器、语音聊天编排和音频协议
 src/memory/             SQLite memory store
 src/models/             模型调用适配层
 src/persona/            Model.md / User.md 文件管理

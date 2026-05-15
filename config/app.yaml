@@ -58,3 +58,22 @@ routes:
       temperature: 0.0
       response_format:
         type: json_object
+
+audio:
+  stt:
+    provider: volcengine
+    url: wss://openspeech.bytedance.com/api/v3/sauc/bigmodel
+    app_id_env: VOLCENGINE_APP_ID
+    access_key_env: VOLCENGINE_ACCESS_KEY
+    resource_id_env: VOLCENGINE_RESOURCE_ID
+    sample_rate: 16000
+    timeout_seconds: 60
+
+  tts:
+    provider: dashscope
+    realtime_url: wss://dashscope.aliyuncs.com/api-ws/v1/realtime
+    api_key_env: DASHSCOPE_API_KEY
+    model: qwen3-tts-flash-realtime
+    voice: Cherry
+    sample_rate: 24000
+    timeout_seconds: 60

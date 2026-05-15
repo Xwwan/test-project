@@ -12,6 +12,7 @@
 | Method | Path | 描述 |
 | --- | --- | --- |
 | `POST` | `/chat` | 处理一条用户消息，返回首条回复 |
+| `POST` | `/voice/chat` | 处理一段用户语音，返回识别文本、首条回复和可选语音 |
 | `GET`  | `/followups/pending` | 列出等待 followup 决策的请求 |
 | `POST` | `/followups/{request_id}/run` | 触发某个请求的二次回复判断 |
 | `POST` | `/memory/curate` | 对一段对话运行 Memory Curator 并落库 |
@@ -67,7 +68,44 @@
 
 ---
 
-## 3. `GET /followups/pending`
+## 3. `POST /voice/chat`
+
+请求：
+
+```json
+{
+  "conversation_id": "string",
+  "audio_base64": "base64 encoded 16kHz 16-bit mono PCM",
+  "audio_format": "pcm",
+  "tts_enabled": true
+}
+```
+
+响应：
+
+```json
+{
+  "request_id": "req_<uuid4_hex>",
+  "turn_id": "turn_<uuid4_hex>",
+  "conversation_id": "string",
+  "transcript": "string",
+  "reply": "string",
+  "retrieval_status": "completed | pending | failed",
+  "retrieved_memory_ids": [int],
+  "audio_base64": "base64 encoded PCM | null",
+  "audio_format": "pcm"
+}
+```
+
+约定：
+
+- `audio_format` 当前只保证 `pcm`。默认值为 `pcm`。
+- `tts_enabled=false` 时跳过 TTS，响应里的 `audio_base64` 为 `null`。
+- 语音识别后的 `transcript` 会复用 `/chat` 的现有文本对话流程，因此同样会写入对话历史并进入 retrieval/followup 生命周期。
+
+---
+
+## 4. `GET /followups/pending`
 
 响应：
 
@@ -86,7 +124,7 @@
 
 ---
 
-## 4. `POST /followups/{request_id}/run`
+## 5. `POST /followups/{request_id}/run`
 
 请求体可省略或为 `{}`。
 
@@ -111,7 +149,7 @@
 
 ---
 
-## 5. `POST /memory/curate`
+## 6. `POST /memory/curate`
 
 请求：
 
@@ -146,7 +184,7 @@
 
 ---
 
-## 6. Memory Curator 输出 schema
+## 7. Memory Curator 输出 schema
 
 参考 `docs/tasks/person-3-orchestration-curator.md` 第 5.3 节。Person 3
 归一化后保证：
@@ -183,7 +221,7 @@
 
 ---
 
-## 7. `POST /memory/profile/refresh`
+## 8. `POST /memory/profile/refresh`
 
 请求体为空 `{}`。
 
@@ -211,7 +249,7 @@
 
 ---
 
-## 8. Request Coordinator 内部状态机
+## 9. Request Coordinator 内部状态机
 
 ```
 received
@@ -227,7 +265,7 @@ failed                          (任意阶段失败)
 
 ---
 
-## 9. Dialogue Service 对 Person 1 / Person 2 的依赖
+## 10. Dialogue Service 对 Person 1 / Person 2 的依赖
 
 所有依赖通过 `DialogueDependencies` 注入，包括但不限于：
 

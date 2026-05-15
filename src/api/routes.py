@@ -26,6 +26,7 @@ from src.coordinator import (
     RequestStateError,
     get_pending_followup_requests,
 )
+from src.audio import AudioDependencies, VoiceChatRequest, handle_voice_chat
 from src.services import (
     DialogueDependencies,
     curate_conversation_memory,
@@ -56,6 +57,7 @@ def dispatch(
     body: Any = None,
     *,
     dependencies: DialogueDependencies | None = None,
+    audio_dependencies: AudioDependencies | None = None,
 ) -> JSONResponse:
     """Route one request to the right service function."""
 
@@ -70,6 +72,8 @@ def dispatch(
     try:
         if method == "POST" and pure_path == "/chat":
             return _post_chat(body, dependencies)
+        if method == "POST" and pure_path == "/voice/chat":
+            return _post_voice_chat(body, dependencies, audio_dependencies)
         if method == "GET" and pure_path == "/followups/pending":
             return _get_pending_followups()
         if method == "POST" and _FOLLOWUP_RUN_PATTERN.match(pure_path):
@@ -114,6 +118,23 @@ def _post_chat(body: Any, dependencies: DialogueDependencies | None) -> JSONResp
         reply=payload["reply"],
         retrieval_status=payload["retrieval_status"],
         retrieved_memory_ids=payload.get("retrieved_memory_ids", []),
+    )
+    return 200, response.to_dict()
+
+
+def _post_voice_chat(
+    body: Any,
+    dependencies: DialogueDependencies | None,
+    audio_dependencies: AudioDependencies | None,
+) -> JSONResponse:
+    request = VoiceChatRequest.from_dict(body or {})
+    response = handle_voice_chat(
+        request.conversation_id,
+        request.audio_bytes,
+        audio_format=request.audio_format,
+        tts_enabled=request.tts_enabled,
+        dependencies=audio_dependencies,
+        dialogue_dependencies=dependencies,
     )
     return 200, response.to_dict()
 
@@ -190,11 +211,13 @@ def _error(status: int, message: str) -> JSONResponse:
 
 def create_request_handler(
     dependencies: DialogueDependencies | None = None,
+    audio_dependencies: AudioDependencies | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Return a request handler class bound to ``dependencies``."""
 
     class _BoundHandler(ChatRequestHandler):
         injected_dependencies = dependencies
+        injected_audio_dependencies = audio_dependencies
 
     return _BoundHandler
 
@@ -203,6 +226,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
     """HTTP adapter that forwards requests to :func:`dispatch`."""
 
     injected_dependencies: DialogueDependencies | None = None
+    injected_audio_dependencies: AudioDependencies | None = None
     server_version = "ChatService/0.1"
 
     def do_GET(self) -> None:  # noqa: N802 - http.server naming
@@ -228,6 +252,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             self.path,
             body,
             dependencies=type(self).injected_dependencies,
+            audio_dependencies=type(self).injected_audio_dependencies,
         )
         self._write_json(status, response_body)
 
@@ -261,9 +286,13 @@ def build_app(
     port: int = 8000,
     *,
     dependencies: DialogueDependencies | None = None,
+    audio_dependencies: AudioDependencies | None = None,
     server_class: Callable[..., HTTPServer] = HTTPServer,
 ) -> HTTPServer:
     """Build (but do not start) an :class:`HTTPServer` ready to serve the API."""
 
-    handler_cls = create_request_handler(dependencies=dependencies)
+    handler_cls = create_request_handler(
+        dependencies=dependencies,
+        audio_dependencies=audio_dependencies,
+    )
     return server_class((host, port), handler_cls)
