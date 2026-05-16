@@ -21,12 +21,26 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-from src.coordinator import (
-    RequestNotFoundError,
-    RequestStateError,
-    get_pending_followup_requests,
+from src.coordinator import RequestNotFoundError, RequestStateError, get_pending_followup_requests
+from src.audio.live_asr import (
+    LiveAsrSessionManager,
+    LiveAsrSessionNotFoundError,
+    get_default_live_asr_manager,
 )
-from src.audio import AudioDependencies, VoiceChatRequest, handle_voice_chat
+from src.audio.schemas import (
+    LiveVoiceAbortRequest,
+    LiveVoiceChunkRequest,
+    LiveVoiceFinishRequest,
+    LiveVoiceStartRequest,
+    LiveVoiceStartResponse,
+    LiveVoiceTranscriptResponse,
+    VoiceChatRequest,
+)
+from src.audio.service import (
+    AudioDependencies,
+    handle_voice_chat,
+    handle_voice_reply_from_text,
+)
 from src.services import (
     DialogueDependencies,
     curate_conversation_memory,
@@ -58,6 +72,7 @@ def dispatch(
     *,
     dependencies: DialogueDependencies | None = None,
     audio_dependencies: AudioDependencies | None = None,
+    live_asr_manager: LiveAsrSessionManager | None = None,
 ) -> JSONResponse:
     """Route one request to the right service function."""
 
@@ -68,12 +83,28 @@ def dispatch(
 
     method = method.upper()
     pure_path = urlsplit(path).path
+    query = urlsplit(path).query
 
     try:
         if method == "POST" and pure_path == "/chat":
             return _post_chat(body, dependencies)
         if method == "POST" and pure_path == "/voice/chat":
             return _post_voice_chat(body, dependencies, audio_dependencies)
+        if method == "POST" and pure_path == "/voice/live/start":
+            return _post_voice_live_start(body, live_asr_manager)
+        if method == "POST" and pure_path == "/voice/live/chunk":
+            return _post_voice_live_chunk(body, live_asr_manager)
+        if method == "GET" and pure_path == "/voice/live/transcript":
+            return _get_voice_live_transcript(query, live_asr_manager)
+        if method == "POST" and pure_path == "/voice/live/finish":
+            return _post_voice_live_finish(
+                body,
+                dependencies,
+                audio_dependencies,
+                live_asr_manager,
+            )
+        if method == "POST" and pure_path == "/voice/live/abort":
+            return _post_voice_live_abort(body, live_asr_manager)
         if method == "GET" and pure_path == "/followups/pending":
             return _get_pending_followups()
         if method == "POST" and _FOLLOWUP_RUN_PATTERN.match(pure_path):
@@ -89,6 +120,8 @@ def dispatch(
         return _error(400, str(exc))
     except (ValueError, TypeError) as exc:
         return _error(400, str(exc))
+    except LiveAsrSessionNotFoundError as exc:
+        return _error(404, str(exc))
     except RequestNotFoundError as exc:
         return _error(404, str(exc))
     except RequestStateError as exc:
@@ -137,6 +170,85 @@ def _post_voice_chat(
         dialogue_dependencies=dependencies,
     )
     return 200, response.to_dict()
+
+
+def _post_voice_live_start(
+    body: Any,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    request = LiveVoiceStartRequest.from_dict(body or {})
+    manager = live_asr_manager or get_default_live_asr_manager()
+    session_id = manager.start_session(
+        request.sample_rate,
+        request.channels,
+        request.audio_format,
+    )
+    response = LiveVoiceStartResponse(
+        session_id=session_id,
+        sample_rate=request.sample_rate,
+        channels=request.channels,
+        audio_format=request.audio_format,
+    )
+    return 200, response.to_dict()
+
+
+def _post_voice_live_chunk(
+    body: Any,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    request = LiveVoiceChunkRequest.from_dict(body or {})
+    manager = live_asr_manager or get_default_live_asr_manager()
+    accepted_bytes = manager.submit_chunk(request.session_id, request.audio_bytes)
+    return 200, {"ok": True, "accepted_bytes": accepted_bytes}
+
+
+def _get_voice_live_transcript(
+    query: str,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    from urllib.parse import parse_qs
+
+    session_id = (parse_qs(query).get("session_id") or [""])[0]
+    manager = live_asr_manager or get_default_live_asr_manager()
+    state = manager.get_transcript(session_id)
+    response = LiveVoiceTranscriptResponse(
+        session_id=session_id,
+        transcript=state.transcript,
+        is_final=state.is_final,
+        error=state.error,
+    )
+    return 200, response.to_dict()
+
+
+def _post_voice_live_finish(
+    body: Any,
+    dependencies: DialogueDependencies | None,
+    audio_dependencies: AudioDependencies | None,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    request = LiveVoiceFinishRequest.from_dict(body or {})
+    manager = live_asr_manager or get_default_live_asr_manager()
+    state = manager.finish_session(request.session_id)
+    if state.error:
+        raise ValueError(state.error)
+    response = handle_voice_reply_from_text(
+        request.conversation_id,
+        state.transcript,
+        tts_enabled=request.tts_enabled,
+        dependencies=audio_dependencies,
+        dialogue_dependencies=dependencies,
+    )
+    return 200, response.to_dict()
+
+
+def _post_voice_live_abort(
+    body: Any,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    request = LiveVoiceAbortRequest.from_dict(body or {})
+    manager = live_asr_manager or get_default_live_asr_manager()
+    manager.abort_session(request.session_id)
+    return 200, {"ok": True}
 
 
 def _get_pending_followups() -> JSONResponse:
@@ -212,12 +324,14 @@ def _error(status: int, message: str) -> JSONResponse:
 def create_request_handler(
     dependencies: DialogueDependencies | None = None,
     audio_dependencies: AudioDependencies | None = None,
+    live_asr_manager: LiveAsrSessionManager | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Return a request handler class bound to ``dependencies``."""
 
     class _BoundHandler(ChatRequestHandler):
         injected_dependencies = dependencies
         injected_audio_dependencies = audio_dependencies
+        injected_live_asr_manager = live_asr_manager
 
     return _BoundHandler
 
@@ -227,6 +341,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
 
     injected_dependencies: DialogueDependencies | None = None
     injected_audio_dependencies: AudioDependencies | None = None
+    injected_live_asr_manager: LiveAsrSessionManager | None = None
     server_version = "ChatService/0.1"
 
     def do_GET(self) -> None:  # noqa: N802 - http.server naming
@@ -253,6 +368,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             body,
             dependencies=type(self).injected_dependencies,
             audio_dependencies=type(self).injected_audio_dependencies,
+            live_asr_manager=type(self).injected_live_asr_manager,
         )
         self._write_json(status, response_body)
 
@@ -287,6 +403,7 @@ def build_app(
     *,
     dependencies: DialogueDependencies | None = None,
     audio_dependencies: AudioDependencies | None = None,
+    live_asr_manager: LiveAsrSessionManager | None = None,
     server_class: Callable[..., HTTPServer] = HTTPServer,
 ) -> HTTPServer:
     """Build (but do not start) an :class:`HTTPServer` ready to serve the API."""
@@ -294,5 +411,6 @@ def build_app(
     handler_cls = create_request_handler(
         dependencies=dependencies,
         audio_dependencies=audio_dependencies,
+        live_asr_manager=live_asr_manager,
     )
     return server_class((host, port), handler_cls)

@@ -52,11 +52,32 @@ def handle_voice_chat(
 
     deps = (dependencies or AudioDependencies()).resolved()
     transcript = deps.stt_client.transcribe(bytes(audio_bytes), audio_format=audio_format)
+    return handle_voice_reply_from_text(
+        conversation_id,
+        transcript,
+        tts_enabled=tts_enabled,
+        dependencies=deps,
+        dialogue_dependencies=dialogue_dependencies,
+    )
+
+
+def handle_voice_reply_from_text(
+    conversation_id: str,
+    transcript: str,
+    *,
+    tts_enabled: bool = True,
+    dependencies: AudioDependencies | None = None,
+    dialogue_dependencies: DialogueDependencies | None = None,
+) -> VoiceChatResponse:
+    if not isinstance(conversation_id, str) or not conversation_id:
+        raise ValueError("conversation_id must be a non-empty string")
     if not isinstance(transcript, str) or not transcript.strip():
-        raise ValueError("speech recognition produced an empty transcript")
+        raise ValueError("transcript must be a non-empty string")
     transcript = transcript.strip()
 
-    chat_payload = deps.chat_handler(
+    deps = dependencies or AudioDependencies()
+    chat_handler = deps.chat_handler or handle_chat_message
+    chat_payload = chat_handler(
         conversation_id,
         transcript,
         dependencies=dialogue_dependencies,
@@ -65,7 +86,10 @@ def handle_voice_chat(
     if not isinstance(reply, str):
         raise ValueError("chat handler must return a string reply")
 
-    output_audio = deps.tts_client.synthesize(reply) if tts_enabled else None
+    output_audio = None
+    if tts_enabled:
+        tts_client = deps.tts_client or build_default_tts_client()
+        output_audio = tts_client.synthesize(reply)
     return VoiceChatResponse(
         conversation_id=chat_payload["conversation_id"],
         request_id=chat_payload["request_id"],

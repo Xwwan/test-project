@@ -13,6 +13,11 @@
 | --- | --- | --- |
 | `POST` | `/chat` | 处理一条用户消息，返回首条回复 |
 | `POST` | `/voice/chat` | 处理一段用户语音，返回识别文本、首条回复和可选语音 |
+| `POST` | `/voice/live/start` | 开始实时语音识别会话 |
+| `POST` | `/voice/live/chunk` | 向实时语音识别会话提交一段 PCM 音频 |
+| `GET`  | `/voice/live/transcript` | 查询实时语音识别会话的最新字幕 |
+| `POST` | `/voice/live/finish` | 结束实时语音识别会话，并用最终文本生成回复和可选语音 |
+| `POST` | `/voice/live/abort` | 中止实时语音识别会话，不生成回复 |
 | `GET`  | `/followups/pending` | 列出等待 followup 决策的请求 |
 | `POST` | `/followups/{request_id}/run` | 触发某个请求的二次回复判断 |
 | `POST` | `/memory/curate` | 对一段对话运行 Memory Curator 并落库 |
@@ -105,7 +110,151 @@
 
 ---
 
-## 4. `GET /followups/pending`
+## 4. 实时语音接口
+
+实时语音接口面向 Reachy app 一类的外部采集端：采集端负责录音、降采样和分块；
+`test-project` 负责持有火山 ASR WebSocket、维护实时字幕，并在结束时复用现有
+文本对话和 TTS 流程。
+
+音频约定：
+
+- PCM little-endian，16kHz，16-bit，mono。
+- 推荐 chunk 为 160ms，即 `5120` bytes。
+- 服务端接受最后一个普通 chunk 小于 `5120` bytes。
+- 停止录音时应调用 `/voice/live/finish`，不要再次把整段音频发到 `/voice/chat`。
+
+### 4.1 `POST /voice/live/start`
+
+请求体可省略；默认值如下：
+
+```json
+{
+  "sample_rate": 16000,
+  "channels": 1,
+  "audio_format": "pcm"
+}
+```
+
+响应：
+
+```json
+{
+  "session_id": "live_<uuid4_hex>",
+  "sample_rate": 16000,
+  "channels": 1,
+  "audio_format": "pcm",
+  "chunk_duration_ms": 160,
+  "chunk_bytes": 5120
+}
+```
+
+约定：
+
+- 当前只接受 `sample_rate=16000`、`channels=1`、`audio_format=pcm`。
+- 成功响应表示服务端已创建实时 ASR 会话，并已发送火山 ASR full client request。
+
+### 4.2 `POST /voice/live/chunk`
+
+请求：
+
+```json
+{
+  "session_id": "live_<uuid4_hex>",
+  "audio_base64": "base64 encoded PCM chunk",
+  "is_final": false
+}
+```
+
+响应：
+
+```json
+{
+  "ok": true,
+  "accepted_bytes": 5120
+}
+```
+
+约定：
+
+- `audio_base64` 必须是合法且非空的 base64。
+- 第一阶段推荐 `is_final=false`，统一由 `/voice/live/finish` 发送 ASR final packet。
+
+### 4.3 `GET /voice/live/transcript?session_id=...`
+
+响应：
+
+```json
+{
+  "session_id": "live_<uuid4_hex>",
+  "transcript": "你好 Reachy",
+  "is_final": false,
+  "error": null
+}
+```
+
+约定：
+
+- 采集端可以每 200-300ms 轮询一次。
+- `error` 非空时表示 ASR 会话已出现可展示错误，采集端应停止继续提交 chunk。
+
+### 4.4 `POST /voice/live/finish`
+
+请求：
+
+```json
+{
+  "session_id": "live_<uuid4_hex>",
+  "conversation_id": "reachy-mini-voice",
+  "tts_enabled": true
+}
+```
+
+响应沿用 `/voice/chat`：
+
+```json
+{
+  "request_id": "req_<uuid4_hex>",
+  "turn_id": "turn_<uuid4_hex>",
+  "conversation_id": "reachy-mini-voice",
+  "transcript": "你好 Reachy",
+  "reply": "你好！",
+  "retrieval_status": "completed | pending | failed",
+  "retrieved_memory_ids": [],
+  "audio_base64": "base64 encoded PCM | null",
+  "audio_format": "pcm"
+}
+```
+
+约定：
+
+- 服务端会向火山 ASR 发送空音频 final packet，并等待最终文本。
+- 拿到最终 `transcript` 后直接复用现有文本对话和 TTS 流程，不再二次 STT。
+- finish 成功或失败后，该 live session 都会从内存 manager 中移除。
+
+### 4.5 `POST /voice/live/abort`
+
+请求：
+
+```json
+{
+  "session_id": "live_<uuid4_hex>"
+}
+```
+
+响应：
+
+```json
+{"ok": true}
+```
+
+约定：
+
+- 用于取消录音或页面关闭。
+- 只关闭 ASR 会话，不调用 chat、memory retrieval 或 TTS。
+
+---
+
+## 5. `GET /followups/pending`
 
 响应：
 
@@ -124,7 +273,7 @@
 
 ---
 
-## 5. `POST /followups/{request_id}/run`
+## 6. `POST /followups/{request_id}/run`
 
 请求体可省略或为 `{}`。
 
@@ -149,7 +298,7 @@
 
 ---
 
-## 6. `POST /memory/curate`
+## 7. `POST /memory/curate`
 
 请求：
 
@@ -180,11 +329,11 @@
 
 - `operations` 即 Memory Curator 调用 LLM 后归一化得到的列表；为空时
   `applied` 也为空。
-- `payload` 字段集合见下方第 6 节。
+- `payload` 字段集合见下方第 8 节。
 
 ---
 
-## 7. Memory Curator 输出 schema
+## 8. Memory Curator 输出 schema
 
 参考 `docs/tasks/person-3-orchestration-curator.md` 第 5.3 节。Person 3
 归一化后保证：
@@ -221,7 +370,7 @@
 
 ---
 
-## 8. `POST /memory/profile/refresh`
+## 9. `POST /memory/profile/refresh`
 
 请求体为空 `{}`。
 
@@ -249,7 +398,7 @@
 
 ---
 
-## 9. Request Coordinator 内部状态机
+## 10. Request Coordinator 内部状态机
 
 ```
 received
@@ -265,7 +414,7 @@ failed                          (任意阶段失败)
 
 ---
 
-## 10. Dialogue Service 对 Person 1 / Person 2 的依赖
+## 11. Dialogue Service 对 Person 1 / Person 2 的依赖
 
 所有依赖通过 `DialogueDependencies` 注入，包括但不限于：
 

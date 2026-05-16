@@ -133,6 +133,59 @@ curl -s -X POST http://127.0.0.1:8000/voice/chat \
 
 返回里会包含 `transcript`、模型 `reply`，以及开启 TTS 时的 `audio_base64` PCM 音频。
 
+实时语音流程适合 Reachy app 这类外部采集端。采集端负责用机器人麦克风录音、降采样到
+16kHz 16-bit mono PCM，并按 160ms、约 5120 bytes 的粒度提交 chunk；服务端负责持有
+火山 ASR WebSocket、提供实时字幕，并在结束时直接用最终文本生成回复：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/voice/live/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sample_rate": 16000,
+    "channels": 1,
+    "audio_format": "pcm"
+  }'
+```
+
+把返回的 `session_id` 保存下来，录音过程中持续提交 chunk：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/voice/live/chunk \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "live_xxx",
+    "audio_base64": "把单个PCM chunk转成base64后放这里",
+    "is_final": false
+  }'
+```
+
+页面可以每 200-300ms 轮询最新字幕：
+
+```bash
+curl -s "http://127.0.0.1:8000/voice/live/transcript?session_id=live_xxx"
+```
+
+停止录音时调用 finish。服务端会发送 ASR final packet，并复用现有 chat + TTS 流程；
+无需再把整段音频提交到 `/voice/chat` 做第二次 STT：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/voice/live/finish \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "live_xxx",
+    "conversation_id": "reachy-mini-voice",
+    "tts_enabled": true
+  }'
+```
+
+如果用户取消录音或页面关闭，可以中止会话，不生成回复：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/voice/live/abort \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "live_xxx"}'
+```
+
 查询待处理 followup：
 
 ```bash

@@ -5,7 +5,11 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-from src.audio.service import AudioDependencies, handle_voice_chat
+from src.audio.service import (
+    AudioDependencies,
+    handle_voice_chat,
+    handle_voice_reply_from_text,
+)
 
 
 class FakeStt:
@@ -99,6 +103,66 @@ class VoiceServiceTest(unittest.TestCase):
                     stt_client=FakeStt(transcript="  "),
                     tts_client=FakeTts(),
                     chat_handler=lambda conversation_id, message, *, dependencies=None: {},
+                ),
+            )
+
+    def test_handle_voice_reply_from_text_skips_stt_and_runs_tts(self) -> None:
+        stt = FakeStt(transcript="不应调用")
+        tts = FakeTts()
+
+        result = handle_voice_reply_from_text(
+            "conv-1",
+            "  实时字幕  ",
+            dependencies=AudioDependencies(
+                stt_client=stt,
+                tts_client=tts,
+                chat_handler=lambda conversation_id, message, *, dependencies=None: {
+                    "conversation_id": conversation_id,
+                    "request_id": "req-1",
+                    "turn_id": "turn-1",
+                    "reply": f"回复:{message}",
+                    "retrieval_status": "completed",
+                    "retrieved_memory_ids": [],
+                },
+            ),
+        )
+
+        assert result.transcript == "实时字幕"
+        assert result.reply == "回复:实时字幕"
+        assert result.audio_bytes == b"voice"
+        assert stt.last_audio is None
+        assert tts.last_text == "回复:实时字幕"
+
+    def test_handle_voice_reply_from_text_skips_tts_when_disabled(self) -> None:
+        tts = FakeTts()
+
+        result = handle_voice_reply_from_text(
+            "conv-1",
+            "实时字幕",
+            tts_enabled=False,
+            dependencies=AudioDependencies(
+                tts_client=tts,
+                chat_handler=lambda conversation_id, message, *, dependencies=None: {
+                    "conversation_id": conversation_id,
+                    "request_id": "req-1",
+                    "turn_id": "turn-1",
+                    "reply": "回复",
+                    "retrieval_status": "completed",
+                    "retrieved_memory_ids": [],
+                },
+            ),
+        )
+
+        assert result.audio_bytes is None
+        assert tts.last_text is None
+
+    def test_handle_voice_reply_from_text_rejects_blank_transcript(self) -> None:
+        with self.assertRaises(ValueError):
+            handle_voice_reply_from_text(
+                "conv-1",
+                " ",
+                dependencies=AudioDependencies(
+                    chat_handler=lambda conversation_id, message, *, dependencies=None: {}
                 ),
             )
 
