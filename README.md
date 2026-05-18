@@ -24,10 +24,23 @@ conda run -n toy python -m pip install -r requirements.txt
 
 ## 配置
 
-模型配置在：
+默认模型配置在：
 
 ```text
 config/app.yaml
+```
+
+本地个人覆盖配置放在：
+
+```text
+config/app.local.yaml
+```
+
+`config/app.local.yaml` 会在读取 `config/app.yaml` 后自动递归合并，且已被
+`.gitignore` 忽略。可以从示例文件复制：
+
+```bash
+cp config/app.local.example.yaml config/app.local.yaml
 ```
 
 配置分为两层：
@@ -74,6 +87,7 @@ DASHSCOPE_API_KEY=你的 DashScope API Key
 ```
 
 如果使用本地 OpenAI-compatible 服务，可以把 route 的 `provider` 改成 `local_openai_compatible`，并按实际服务修改 `base_url` 和 `model`。
+推荐把这些个人覆盖写在 `config/app.local.yaml`，这样不会污染 git 工作区。
 
 ## 测试
 
@@ -300,14 +314,14 @@ tests/                  unittest 测试
 以下文件不应提交：
 
 - `.env`
+- `config/app.local.yaml`
 - `data/app.db`
 - Python `__pycache__/`
 - 本地 IDE 配置
 
-如果你想本地修改 `config/app.yaml`、`data/Model.md` 或 `data/User.md` 但不提交，可以使用：
+如果你想本地修改 `data/Model.md` 或 `data/User.md` 但不提交，可以使用：
 
 ```bash
-git update-index --skip-worktree config/app.yaml
 git update-index --skip-worktree data/Model.md
 git update-index --skip-worktree data/User.md
 ```
@@ -315,7 +329,6 @@ git update-index --skip-worktree data/User.md
 取消本地忽略：
 
 ```bash
-git update-index --no-skip-worktree config/app.yaml
 git update-index --no-skip-worktree data/Model.md
 git update-index --no-skip-worktree data/User.md
 ```

@@ -45,6 +45,9 @@ data/*.sqlite3
 .env.*
 !.env.example
 
+# Local-only config overrides
+config/*.local.yaml
+
 .claude
 AGENTS.md
 data/latency-results
