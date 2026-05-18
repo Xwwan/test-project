@@ -96,7 +96,8 @@ conda run -n toy python scripts/latency_benchmark.py --repeat 3
 默认会使用 `dialogue.initial` route 和内置的多段中文场景，按流式模型调用统计
 首个文本 delta 到达耗时，并输出首 delta 平均值、中位数、最小值、最大值和标准差。
 脚本会默认把完整结果保存到 `data/latency-results/` 下的时间戳 JSON 文件，文件里
-包含每段 prompt、完整模型回复、简洁 delta 列表、首 delta 耗时和完整回复总耗时。
+包含 route、provider、model、每段 prompt、完整模型回复、简洁 delta 列表、首
+delta 耗时和完整回复总耗时。
 
 如果要调整文本场景，准备一个文本文件，每行一段输入：
 

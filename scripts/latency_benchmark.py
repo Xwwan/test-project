@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models import ChatMessage, ModelClient, chat_stream
+from src.models import ChatMessage, ModelClient, build_default_client, chat_stream
 
 
 DEFAULT_PROMPTS = [
@@ -39,6 +39,8 @@ class LatencySample:
     iteration: int
     prompt: str
     prompt_chars: int
+    model: str | None
+    provider: str | None
     first_delta_ms: float
     total_ms: float
     reply: str
@@ -60,6 +62,8 @@ class LatencySummary:
 @dataclass(frozen=True)
 class LatencyBenchmarkResult:
     route: str | None
+    model: str | None
+    provider: str | None
     samples: list[LatencySample]
     summary: LatencySummary
     saved_at: str | None = None
@@ -67,6 +71,8 @@ class LatencyBenchmarkResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "route": self.route,
+            "model": self.model,
+            "provider": self.provider,
             "saved_at": self.saved_at,
             "samples": [asdict(sample) for sample in self.samples],
             "summary": asdict(self.summary),
@@ -95,8 +101,12 @@ def run_text_latency_benchmark(
         raise ValueError("repeat must be a positive integer")
 
     samples: list[LatencySample] = []
+    active_client = client
+    if chat_call is None and active_client is None:
+        active_client = build_default_client(route=route)
+    model_name, provider_name = _model_client_metadata(active_client)
     call = chat_call or (
-        lambda messages: chat_stream(messages, client=client, route=route)
+        lambda messages: chat_stream(messages, client=active_client, route=route)
     )
 
     for iteration in range(1, repeat + 1):
@@ -131,6 +141,8 @@ def run_text_latency_benchmark(
                     iteration=iteration,
                     prompt=prompt,
                     prompt_chars=len(prompt),
+                    model=model_name,
+                    provider=provider_name,
                     first_delta_ms=first_delta_ms,
                     total_ms=total_ms,
                     reply=reply,
@@ -148,6 +160,8 @@ def run_text_latency_benchmark(
 
     return LatencyBenchmarkResult(
         route=route,
+        model=model_name,
+        provider=provider_name,
         samples=samples,
         summary=_summarize(samples),
     )
@@ -225,6 +239,8 @@ def save_benchmark_result(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     saved = LatencyBenchmarkResult(
         route=result.route,
+        model=result.model,
+        provider=result.provider,
         samples=result.samples,
         summary=result.summary,
         saved_at=timestamp,
@@ -238,10 +254,13 @@ def save_benchmark_result(
 
 def _print_report(result: LatencyBenchmarkResult) -> None:
     route = result.route or "default"
-    print(f"Text latency benchmark route={route}")
+    model = result.model or "unknown"
+    provider = result.provider or "unknown"
+    print(f"Text latency benchmark route={route} provider={provider} model={model}")
     for sample in result.samples:
         print(
             f"- prompt={sample.prompt_index} iteration={sample.iteration} "
+            f"provider={sample.provider or 'unknown'} model={sample.model or 'unknown'} "
             f"first_delta={sample.first_delta_ms:.1f}ms "
             f"total={sample.total_ms:.1f}ms prompt_chars={sample.prompt_chars} "
             f"reply_chars={sample.reply_chars} deltas={len(sample.deltas)}"
@@ -257,6 +276,19 @@ def _print_report(result: LatencyBenchmarkResult) -> None:
 
 def _print_progress(message: str) -> None:
     print(message, flush=True)
+
+
+def _model_client_metadata(client: ModelClient | None) -> tuple[str | None, str | None]:
+    if client is None:
+        return None, None
+    model = getattr(client, "default_model", None)
+    if not isinstance(model, str) or not model:
+        model = getattr(client, "model", None)
+    provider = getattr(client, "provider", None)
+    return (
+        model if isinstance(model, str) and model else None,
+        provider if isinstance(provider, str) and provider else None,
+    )
 
 
 def _safe_filename_part(value: str) -> str:

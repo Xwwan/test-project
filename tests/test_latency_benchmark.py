@@ -17,24 +17,23 @@ from scripts.latency_benchmark import (
 class LatencyBenchmarkTest(unittest.TestCase):
     def test_run_text_latency_benchmark_collects_samples_and_summary(self) -> None:
         times = iter([10.0, 10.1, 10.3, 20.0, 20.3, 20.8])
-        seen_prompts: list[str] = []
-
-        def fake_chat(messages):
-            seen_prompts.append(messages[-1].content)
-            yield "回"
-            yield "复"
+        client = FakeStreamingClient(["回", "复"])
 
         with patch("scripts.latency_benchmark.time.perf_counter", side_effect=times):
             result = run_text_latency_benchmark(
                 ["第一段", "第二段"],
                 repeat=1,
                 route="dialogue.initial",
-                chat_call=fake_chat,
+                client=client,
             )
 
-        self.assertEqual(seen_prompts, ["第一段", "第二段"])
+        self.assertEqual(client.seen_prompts, ["第一段", "第二段"])
+        self.assertEqual(result.model, "test-model")
+        self.assertEqual(result.provider, "test-provider")
         self.assertEqual(result.summary.count, 2)
         self.assertEqual(result.samples[0].prompt, "第一段")
+        self.assertEqual(result.samples[0].model, "test-model")
+        self.assertEqual(result.samples[0].provider, "test-provider")
         self.assertEqual(result.samples[0].reply, "回复")
         self.assertEqual(result.samples[0].deltas, ["回", "复"])
         self.assertAlmostEqual(result.samples[0].first_delta_ms, 100.0)
@@ -84,11 +83,26 @@ class LatencyBenchmarkTest(unittest.TestCase):
                 "latency-20260518-121314-dialogue-initial.json",
             )
             saved = Path(path).read_text(encoding="utf-8")
+            self.assertIn('"model": null', saved)
+            self.assertIn('"provider": null', saved)
             self.assertIn('"prompt": "第一段"', saved)
             self.assertIn('"reply": "完整回复"', saved)
             self.assertIn('"deltas": [', saved)
             self.assertIn('"完整"', saved)
             self.assertIn('"回复"', saved)
+
+
+class FakeStreamingClient:
+    provider = "test-provider"
+
+    def __init__(self, chunks: list[str]) -> None:
+        self.default_model = "test-model"
+        self.chunks = chunks
+        self.seen_prompts: list[str] = []
+
+    def chat_stream(self, messages, **kwargs):
+        self.seen_prompts.append(messages[-1].content)
+        yield from self.chunks
 
 
 if __name__ == "__main__":
