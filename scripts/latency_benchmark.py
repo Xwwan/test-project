@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models import ChatMessage, ChatResponse, ModelClient, chat_once
+from src.models import ChatMessage, ModelClient, chat_stream
 
 
 DEFAULT_PROMPTS = [
@@ -39,10 +39,12 @@ class LatencySample:
     iteration: int
     prompt: str
     prompt_chars: int
-    elapsed_ms: float
+    first_delta_ms: float
+    total_ms: float
     reply: str
     reply_chars: int
     reply_preview: str
+    deltas: list[str]
 
 
 @dataclass(frozen=True)
@@ -71,7 +73,7 @@ class LatencyBenchmarkResult:
         }
 
 
-ChatCall = Callable[[list[ChatMessage]], ChatResponse]
+StreamChatCall = Callable[[list[ChatMessage]], Any]
 
 
 def run_text_latency_benchmark(
@@ -81,7 +83,7 @@ def run_text_latency_benchmark(
     route: str | None = "dialogue.initial",
     system_prompt: str = "你是一个自然、简洁的中文对话助手。",
     client: ModelClient | None = None,
-    chat_call: ChatCall | None = None,
+    chat_call: StreamChatCall | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> LatencyBenchmarkResult:
     """Call the configured model for every prompt and return latency stats."""
@@ -94,7 +96,7 @@ def run_text_latency_benchmark(
 
     samples: list[LatencySample] = []
     call = chat_call or (
-        lambda messages: chat_once(messages, client=client, route=route)
+        lambda messages: chat_stream(messages, client=client, route=route)
     )
 
     for iteration in range(1, repeat + 1):
@@ -109,24 +111,39 @@ def run_text_latency_benchmark(
                 ChatMessage(role="user", content=prompt),
             ]
             started = time.perf_counter()
-            response = call(messages)
-            elapsed_ms = (time.perf_counter() - started) * 1000
+            deltas: list[str] = []
+            first_delta_ms: float | None = None
+            for delta in call(messages):
+                if not isinstance(delta, str):
+                    raise TypeError("stream chat call must yield strings")
+                if not delta:
+                    continue
+                if first_delta_ms is None:
+                    first_delta_ms = (time.perf_counter() - started) * 1000
+                deltas.append(delta)
+            total_ms = (time.perf_counter() - started) * 1000
+            if first_delta_ms is None:
+                raise ValueError("stream chat call did not yield any text delta")
+            reply = "".join(deltas)
             samples.append(
                 LatencySample(
                     prompt_index=prompt_index,
                     iteration=iteration,
                     prompt=prompt,
                     prompt_chars=len(prompt),
-                    elapsed_ms=elapsed_ms,
-                    reply=response.content,
-                    reply_chars=len(response.content),
-                    reply_preview=response.content[:80],
+                    first_delta_ms=first_delta_ms,
+                    total_ms=total_ms,
+                    reply=reply,
+                    reply_chars=len(reply),
+                    reply_preview=reply[:80],
+                    deltas=deltas,
                 )
             )
             if progress:
                 progress(
                     f"Done prompt {prompt_index}/{len(clean_prompts)} "
-                    f"iteration {iteration}/{repeat}: {elapsed_ms:.1f}ms"
+                    f"iteration {iteration}/{repeat}: "
+                    f"first_delta={first_delta_ms:.1f}ms total={total_ms:.1f}ms"
                 )
 
     return LatencyBenchmarkResult(
@@ -185,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _summarize(samples: list[LatencySample]) -> LatencySummary:
-    values = [sample.elapsed_ms for sample in samples]
+    values = [sample.first_delta_ms for sample in samples]
     return LatencySummary(
         count=len(values),
         average_ms=statistics.fmean(values),
@@ -225,13 +242,14 @@ def _print_report(result: LatencyBenchmarkResult) -> None:
     for sample in result.samples:
         print(
             f"- prompt={sample.prompt_index} iteration={sample.iteration} "
-            f"elapsed={sample.elapsed_ms:.1f}ms "
-            f"prompt_chars={sample.prompt_chars} reply_chars={sample.reply_chars}"
+            f"first_delta={sample.first_delta_ms:.1f}ms "
+            f"total={sample.total_ms:.1f}ms prompt_chars={sample.prompt_chars} "
+            f"reply_chars={sample.reply_chars} deltas={len(sample.deltas)}"
         )
     summary = result.summary
     print(
         "Summary: "
-        f"count={summary.count}, avg={summary.average_ms:.1f}ms, "
+        f"first_delta_count={summary.count}, avg={summary.average_ms:.1f}ms, "
         f"median={summary.median_ms:.1f}ms, min={summary.min_ms:.1f}ms, "
         f"max={summary.max_ms:.1f}ms, stdev={summary.stdev_ms:.1f}ms"
     )
