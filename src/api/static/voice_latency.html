@@ -291,7 +291,7 @@
       stopButton.disabled = true;
       abortButton.disabled = true;
       await flushChunks();
-      const response = await postJson("/voice/live/finish", {
+      const response = await postJson("/tools/voice-latency/finish", {
         session_id: sessionId,
         conversation_id: conversationIdInput.value.trim() || "voice-latency-demo",
         tts_enabled: false,

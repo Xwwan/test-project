@@ -106,6 +106,8 @@ def dispatch(
                 audio_dependencies,
                 live_asr_manager,
             )
+        if method == "POST" and pure_path == "/tools/voice-latency/finish":
+            return _post_voice_latency_finish(body, audio_dependencies, live_asr_manager)
         if method == "POST" and pure_path == "/voice/live/abort":
             return _post_voice_live_abort(body, live_asr_manager)
         if method == "GET" and pure_path == "/followups/pending":
@@ -244,6 +246,30 @@ def _post_voice_live_finish(
     return 200, response.to_dict()
 
 
+def _post_voice_latency_finish(
+    body: Any,
+    audio_dependencies: AudioDependencies | None,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    """Finish a live ASR session and reply without writing conversation data."""
+
+    request = LiveVoiceFinishRequest.from_dict(body or {})
+    manager = live_asr_manager or get_default_live_asr_manager()
+    state = manager.finish_session(request.session_id)
+    if state.error:
+        raise ValueError(state.error)
+
+    audio_deps = audio_dependencies or AudioDependencies()
+    response = handle_voice_reply_from_text(
+        request.conversation_id,
+        state.transcript,
+        tts_enabled=request.tts_enabled,
+        dependencies=audio_deps.with_overrides(chat_handler=_handle_latency_chat_message),
+        dialogue_dependencies=_build_no_db_latency_dependencies(),
+    )
+    return 200, response.to_dict()
+
+
 def _post_voice_live_abort(
     body: Any,
     live_asr_manager: LiveAsrSessionManager | None,
@@ -317,6 +343,57 @@ def _post_memory_profile_refresh(
 
 def _error(status: int, message: str) -> JSONResponse:
     return status, {"error": {"message": message}}
+
+
+def _handle_latency_chat_message(
+    conversation_id: str,
+    message: str,
+    *,
+    dependencies: DialogueDependencies | None = None,
+) -> dict:
+    """Run the normal initial reply flow with no-op persistence dependencies."""
+
+    return handle_chat_message(
+        conversation_id,
+        message,
+        dependencies=dependencies or _build_no_db_latency_dependencies(),
+    )
+
+
+def _build_no_db_latency_dependencies() -> DialogueDependencies:
+    """Build dependencies for latency probes that must not write to SQLite."""
+
+    from src.agents.dialogue_agent import generate_initial_reply
+
+    return DialogueDependencies(
+        read_model_profile=lambda: "",
+        read_user_profile=lambda: "",
+        apply_user_profile_patch=lambda patch: "",
+        append_turn=lambda conversation_id, turn: turn["turn_id"],
+        get_recent_history=lambda conversation_id, limit=20: [],
+        get_compact_history=lambda conversation_id: "",
+        update_compact_history=lambda conversation_id, value: None,
+        list_lightweight_memory_items=lambda status="active": [],
+        get_memory_items_by_ids=lambda ids: [],
+        apply_memory_operations=lambda operations: [],
+        generate_initial_reply=generate_initial_reply,
+        generate_followup_reply=lambda input_data, **kwargs: {
+            "request_id": input_data["request_id"],
+            "decision": "no_followup",
+            "followup_type": "none",
+            "reply": "",
+        },
+        retrieve_relevant_memory_ids=lambda **kwargs: {
+            "request_id": kwargs["request_id"],
+            "selected_memory_ids": [],
+        },
+        extract_memory_operations=lambda **kwargs: {"operations": []},
+        generate_user_profile_patch=lambda items, current, **kwargs: {
+            "should_update": False,
+            "patch": None,
+            "reason": "latency probe",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

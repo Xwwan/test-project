@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import base64
 import unittest
+from unittest.mock import patch
 
 from src.api.routes import dispatch
+from src.coordinator import request_coordinator
 from src.audio.live_asr import LiveAsrSessionNotFoundError, LiveTranscriptState
 from src.audio.service import AudioDependencies
 
 
 class VoiceApiRoutesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        request_coordinator.reset_store()
+
+    def tearDown(self) -> None:
+        request_coordinator.reset_store()
+
     def test_post_voice_chat_returns_transcript_reply_and_audio(self) -> None:
         deps = AudioDependencies(
             stt_client=type(
@@ -196,6 +204,56 @@ class VoiceApiRoutesTest(unittest.TestCase):
         assert body["reply"] == "回复:实时文本"
         assert body["audio_base64"] == base64.b64encode(b"audio").decode("ascii")
         assert tts_calls == ["回复:实时文本"]
+        assert manager.finished == ["live-1"]
+
+    def test_voice_latency_finish_generates_reply_without_persisting_turns(self) -> None:
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="只测试延迟",
+            is_final=True,
+            error=None,
+        )
+        injected_chat_calls: list[str] = []
+        deps = AudioDependencies(
+            chat_handler=lambda conversation_id, message, *, dependencies=None: injected_chat_calls.append(
+                message
+            )
+            or {
+                "conversation_id": conversation_id,
+                "request_id": "req-injected",
+                "turn_id": "turn-injected",
+                "reply": "不应调用",
+                "retrieval_status": "completed",
+                "retrieved_memory_ids": [],
+            },
+        )
+
+        def fake_initial(input_data, **kwargs):
+            return {
+                "request_id": input_data["request_id"],
+                "reply": f"延迟回复:{input_data['current_query']}",
+            }
+
+        with patch("src.agents.dialogue_agent.generate_initial_reply", fake_initial):
+            status, body = dispatch(
+                "POST",
+                "/tools/voice-latency/finish",
+                {
+                    "session_id": "live-1",
+                    "conversation_id": "conv-latency",
+                    "tts_enabled": False,
+                },
+                audio_dependencies=deps,
+                live_asr_manager=manager,
+            )
+
+        assert status == 200
+        assert body["conversation_id"] == "conv-latency"
+        assert body["transcript"] == "只测试延迟"
+        assert body["reply"] == "延迟回复:只测试延迟"
+        assert body["audio_base64"] is None
+        assert body["retrieved_memory_ids"] == []
+        assert injected_chat_calls == []
         assert manager.finished == ["live-1"]
 
     def test_live_voice_abort_does_not_call_chat(self) -> None:

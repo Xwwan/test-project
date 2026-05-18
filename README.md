@@ -120,7 +120,9 @@ conda run -n toy python -m src.main --host 127.0.0.1 --port 8000 --log-level DEB
 http://127.0.0.1:8000/tools/voice-latency
 ```
 
-页面会用浏览器麦克风采集音频，按 16kHz PCM chunk 提交到 `/voice/live/*`。点击“停止并生成回复”后，页面统计从结束输入到收到模型回复的耗时，并显示实时字幕和模型回复。
+页面会用浏览器麦克风采集音频，按 16kHz PCM chunk 提交到 `/voice/live/*`。点击“停止并生成回复”后，页面会调用 `/tools/voice-latency/finish`，统计从结束输入到收到模型回复的耗时，并显示实时字幕和模型回复。
+
+这个语音延迟测试 endpoint 只使用真实 ASR 和真实模型调用，conversation/history/memory 都使用 no-op 依赖，不会写入本地 SQLite 数据库。
 
 ## 启动服务
 
