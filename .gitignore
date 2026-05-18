@@ -47,3 +47,4 @@ data/*.sqlite3
 
 .claude
 AGENTS.md
+data/latency-results

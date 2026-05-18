@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>语音延迟测试</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18202f;
+      --muted: #5c667a;
+      --line: #d7dce7;
+      --panel: #ffffff;
+      --page: #f5f7fb;
+      --accent: #0f766e;
+      --accent-strong: #115e59;
+      --danger: #b42318;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: var(--page);
+    }
+
+    main {
+      width: min(960px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 32px 0;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: end;
+      margin: 24px 0;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    label {
+      display: grid;
+      gap: 6px;
+      min-width: min(280px, 100%);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    input {
+      width: 100%;
+      height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 10px;
+      color: var(--ink);
+      font: inherit;
+      background: #fff;
+    }
+
+    button {
+      height: 40px;
+      border: 0;
+      border-radius: 6px;
+      padding: 0 14px;
+      color: #fff;
+      font: inherit;
+      font-weight: 600;
+      background: var(--accent);
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: var(--accent-strong);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: .5;
+    }
+
+    button.secondary {
+      color: var(--ink);
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+
+    button.secondary:hover {
+      background: #eef2f7;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .metric,
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .metric {
+      padding: 14px;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 6px;
+      font-size: 24px;
+      letter-spacing: 0;
+    }
+
+    .panel {
+      padding: 16px;
+      margin-top: 12px;
+    }
+
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+
+    pre {
+      min-height: 80px;
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--ink);
+      line-height: 1.5;
+    }
+
+    .status {
+      min-height: 24px;
+      color: var(--muted);
+    }
+
+    .error {
+      color: var(--danger);
+    }
+
+    @media (max-width: 720px) {
+      main {
+        width: min(100vw - 24px, 960px);
+        padding: 20px 0;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      button,
+      label {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>语音延迟测试</h1>
+    <p>浏览器录音会以 16kHz PCM chunk 发送到实时 ASR；点击停止后，页面统计从结束输入到收到模型回复的耗时。</p>
+
+    <section class="toolbar">
+      <label>
+        conversation_id
+        <input id="conversationId" value="voice-latency-demo">
+      </label>
+      <button id="startButton">开始录音</button>
+      <button id="stopButton" class="secondary" disabled>停止并生成回复</button>
+      <button id="abortButton" class="secondary" disabled>取消</button>
+    </section>
+
+    <div class="grid">
+      <div class="metric"><span>录音时长</span><strong id="recordMs">0 ms</strong></div>
+      <div class="metric"><span>停止后到回复</span><strong id="replyMs">0 ms</strong></div>
+      <div class="metric"><span>已发送音频</span><strong id="sentBytes">0 B</strong></div>
+    </div>
+
+    <section class="panel">
+      <h2>状态</h2>
+      <p id="status" class="status">准备就绪</p>
+    </section>
+
+    <section class="panel">
+      <h2>实时字幕</h2>
+      <pre id="transcript"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>模型回复</h2>
+      <pre id="reply"></pre>
+    </section>
+  </main>
+
+  <script>
+    const startButton = document.querySelector("#startButton");
+    const stopButton = document.querySelector("#stopButton");
+    const abortButton = document.querySelector("#abortButton");
+    const conversationIdInput = document.querySelector("#conversationId");
+    const statusEl = document.querySelector("#status");
+    const transcriptEl = document.querySelector("#transcript");
+    const replyEl = document.querySelector("#reply");
+    const recordMsEl = document.querySelector("#recordMs");
+    const replyMsEl = document.querySelector("#replyMs");
+    const sentBytesEl = document.querySelector("#sentBytes");
+
+    const targetSampleRate = 16000;
+    const chunkBytes = 5120;
+    let audioContext = null;
+    let sourceNode = null;
+    let processorNode = null;
+    let stream = null;
+    let sessionId = null;
+    let pendingBytes = [];
+    let pendingLength = 0;
+    let sentBytes = 0;
+    let startedAt = 0;
+    let recordTimer = null;
+    let transcriptTimer = null;
+    let postQueue = Promise.resolve();
+
+    startButton.addEventListener("click", startRecording);
+    stopButton.addEventListener("click", stopAndReply);
+    abortButton.addEventListener("click", abortRecording);
+
+    async function startRecording() {
+      setStatus("正在请求麦克风权限...");
+      clearOutput();
+      const startResponse = await postJson("/voice/live/start", {
+        sample_rate: targetSampleRate,
+        channels: 1,
+        audio_format: "pcm",
+      });
+      sessionId = startResponse.session_id;
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioContext = new AudioContext();
+      sourceNode = audioContext.createMediaStreamSource(stream);
+      processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+      processorNode.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0);
+        enqueuePcm(downsampleToPcm16(input, audioContext.sampleRate, targetSampleRate));
+      };
+      sourceNode.connect(processorNode);
+      processorNode.connect(audioContext.destination);
+      sentBytes = 0;
+      startedAt = performance.now();
+      recordTimer = setInterval(updateRecordMs, 100);
+      transcriptTimer = setInterval(pollTranscript, 250);
+      startButton.disabled = true;
+      stopButton.disabled = false;
+      abortButton.disabled = false;
+      setStatus(`录音中：${sessionId}`);
+    }
+
+    async function stopAndReply() {
+      const stoppedAt = performance.now();
+      setStatus("正在结束 ASR 并等待模型回复...");
+      stopAudioGraph();
+      stopButton.disabled = true;
+      abortButton.disabled = true;
+      await flushChunks();
+      const response = await postJson("/voice/live/finish", {
+        session_id: sessionId,
+        conversation_id: conversationIdInput.value.trim() || "voice-latency-demo",
+        tts_enabled: false,
+      });
+      replyMsEl.textContent = `${Math.round(performance.now() - stoppedAt)} ms`;
+      transcriptEl.textContent = response.transcript || transcriptEl.textContent;
+      replyEl.textContent = response.reply || "";
+      setStatus("完成");
+      resetSession();
+    }
+
+    async function abortRecording() {
+      setStatus("正在取消...");
+      stopAudioGraph();
+      if (sessionId) {
+        await postJson("/voice/live/abort", { session_id: sessionId });
+      }
+      setStatus("已取消");
+      resetSession();
+    }
+
+    function enqueuePcm(bytes) {
+      if (!sessionId || bytes.length === 0) return;
+      pendingBytes.push(bytes);
+      pendingLength += bytes.length;
+      while (pendingLength >= chunkBytes) {
+        const chunk = takeChunk(chunkBytes);
+        postQueue = postQueue.then(() => sendChunk(chunk)).catch(showError);
+      }
+    }
+
+    async function flushChunks() {
+      if (pendingLength > 0) {
+        const chunk = takeChunk(pendingLength);
+        postQueue = postQueue.then(() => sendChunk(chunk)).catch(showError);
+      }
+      await postQueue;
+    }
+
+    async function sendChunk(bytes) {
+      await postJson("/voice/live/chunk", {
+        session_id: sessionId,
+        audio_base64: bytesToBase64(bytes),
+      });
+      sentBytes += bytes.length;
+      sentBytesEl.textContent = `${sentBytes} B`;
+    }
+
+    function takeChunk(size) {
+      const out = new Uint8Array(size);
+      let offset = 0;
+      while (offset < size && pendingBytes.length > 0) {
+        const head = pendingBytes[0];
+        const n = Math.min(head.length, size - offset);
+        out.set(head.slice(0, n), offset);
+        offset += n;
+        if (n === head.length) {
+          pendingBytes.shift();
+        } else {
+          pendingBytes[0] = head.slice(n);
+        }
+      }
+      pendingLength -= size;
+      return out;
+    }
+
+    function downsampleToPcm16(input, sourceRate, targetRate) {
+      const ratio = sourceRate / targetRate;
+      const outputLength = Math.floor(input.length / ratio);
+      const output = new Uint8Array(outputLength * 2);
+      const view = new DataView(output.buffer);
+      for (let i = 0; i < outputLength; i += 1) {
+        const start = Math.floor(i * ratio);
+        const end = Math.min(Math.floor((i + 1) * ratio), input.length);
+        let sum = 0;
+        for (let j = start; j < end; j += 1) sum += input[j];
+        const sample = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
+        view.setInt16(i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      }
+      return output;
+    }
+
+    async function pollTranscript() {
+      if (!sessionId) return;
+      const response = await fetch(`/voice/live/transcript?session_id=${encodeURIComponent(sessionId)}`);
+      const data = await response.json();
+      if (data.transcript) transcriptEl.textContent = data.transcript;
+      if (data.error) showError(new Error(data.error));
+    }
+
+    async function postJson(url, body) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error?.message || `HTTP ${response.status}`);
+      }
+      return data;
+    }
+
+    function bytesToBase64(bytes) {
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 1) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return btoa(binary);
+    }
+
+    function stopAudioGraph() {
+      clearInterval(recordTimer);
+      clearInterval(transcriptTimer);
+      if (processorNode) processorNode.disconnect();
+      if (sourceNode) sourceNode.disconnect();
+      if (stream) stream.getTracks().forEach((track) => track.stop());
+      if (audioContext) audioContext.close();
+      processorNode = null;
+      sourceNode = null;
+      stream = null;
+      audioContext = null;
+    }
+
+    function resetSession() {
+      sessionId = null;
+      pendingBytes = [];
+      pendingLength = 0;
+      postQueue = Promise.resolve();
+      startButton.disabled = false;
+      stopButton.disabled = true;
+      abortButton.disabled = true;
+    }
+
+    function updateRecordMs() {
+      recordMsEl.textContent = `${Math.round(performance.now() - startedAt)} ms`;
+    }
+
+    function clearOutput() {
+      transcriptEl.textContent = "";
+      replyEl.textContent = "";
+      recordMsEl.textContent = "0 ms";
+      replyMsEl.textContent = "0 ms";
+      sentBytesEl.textContent = "0 B";
+      statusEl.classList.remove("error");
+    }
+
+    function setStatus(message) {
+      statusEl.classList.remove("error");
+      statusEl.textContent = message;
+    }
+
+    function showError(error) {
+      statusEl.classList.add("error");
+      statusEl.textContent = error.message || String(error);
+      startButton.disabled = false;
+      stopButton.disabled = true;
+      abortButton.disabled = true;
+      throw error;
+    }
+  </script>
+</body>
+</html>

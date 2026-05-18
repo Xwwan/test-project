@@ -85,6 +85,43 @@ conda run -n toy python -m unittest discover -s tests -p 'test_*.py'
 
 当前应通过全部测试。
 
+## 延迟测试
+
+文本模型延迟测试不会放进全量单元测试自动跑，因为真实模型调用会受网络、服务商负载和 API key 配置影响。可以手动运行：
+
+```bash
+conda run -n toy python scripts/latency_benchmark.py --repeat 3
+```
+
+默认会使用 `dialogue.initial` route 和内置的多段中文场景，输出每次调用耗时、平均值、中位数、最小值、最大值和标准差。
+脚本会默认把完整结果保存到 `data/latency-results/` 下的时间戳 JSON 文件，文件里包含每段 prompt 和完整模型回复。
+
+如果要调整文本场景，准备一个文本文件，每行一段输入：
+
+```bash
+conda run -n toy python scripts/latency_benchmark.py --prompts data/latency-prompts.txt --repeat 3
+```
+
+如果要改保存目录：
+
+```bash
+conda run -n toy python scripts/latency_benchmark.py --repeat 3 --output-dir data/my-latency-results
+```
+
+语音延迟测试复用服务端已有实时 ASR 流程。先启动服务：
+
+```bash
+conda run -n toy python -m src.main --host 127.0.0.1 --port 8000 --log-level DEBUG
+```
+
+然后在浏览器打开：
+
+```text
+http://127.0.0.1:8000/tools/voice-latency
+```
+
+页面会用浏览器麦克风采集音频，按 16kHz PCM chunk 提交到 `/voice/live/*`。点击“停止并生成回复”后，页面统计从结束输入到收到模型回复的耗时，并显示实时字幕和模型回复。
+
 ## 启动服务
 
 ```bash

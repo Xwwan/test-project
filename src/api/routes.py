@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -63,6 +64,8 @@ JSONResponse = tuple[int, dict]
 
 
 _FOLLOWUP_RUN_PATTERN = re.compile(r"^/followups/(?P<request_id>[^/]+)/run$")
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+_VOICE_LATENCY_PAGE = _STATIC_DIR / "voice_latency.html"
 
 
 def dispatch(
@@ -356,6 +359,10 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         return None
 
     def _handle(self, method: str) -> None:
+        if method == "GET" and urlsplit(self.path).path == "/tools/voice-latency":
+            self._write_html_file(_VOICE_LATENCY_PAGE)
+            return
+
         body: Any = None
         if method == "POST":
             body = self._read_json_body()
@@ -389,6 +396,18 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _write_html_file(self, path: Path) -> None:
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            self._write_json(404, {"error": {"message": "static page not found"}})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
