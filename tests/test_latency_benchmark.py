@@ -93,10 +93,11 @@ class LatencyBenchmarkTest(unittest.TestCase):
 
 
 class FakeStreamingClient:
-    provider = "test-provider"
+    provider = "adapter-provider"
 
     def __init__(self, chunks: list[str]) -> None:
         self.default_model = "test-model"
+        self.provider_name = "test-provider"
         self.chunks = chunks
         self.seen_prompts: list[str] = []
 

@@ -111,6 +111,7 @@ routes:
         self.assertEqual(client.api_key, "test-key")
         self.assertEqual(client.base_url, "https://openai.example/v1")
         self.assertEqual(client.default_model, "test-openai-model")
+        self.assertEqual(client.provider_name, "openai_test")
         self.assertEqual(client.timeout, 12.0)
 
     def test_build_default_client_uses_anthropic_yaml_config(self):
@@ -138,6 +139,7 @@ routes:
         self.assertEqual(client.api_key, "test-key")
         self.assertEqual(client.base_url, "https://anthropic.example")
         self.assertEqual(client.default_model, "test-anthropic-model")
+        self.assertEqual(client.provider_name, "anthropic_test")
         self.assertEqual(client.timeout, 15.0)
         self.assertEqual(client.anthropic_version, "2024-01-01")
 
@@ -165,6 +167,7 @@ routes:
         self.assertEqual(client.api_key, "test-key")
         self.assertEqual(client.base_url, "https://gateway.example/v1")
         self.assertEqual(client.default_model, "test-compatible-model")
+        self.assertEqual(client.provider_name, "compatible_test")
         self.assertEqual(client.timeout, 8.0)
 
     def test_build_default_client_uses_api_key_fallback_for_local_provider(self):

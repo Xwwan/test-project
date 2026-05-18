@@ -166,6 +166,7 @@ def build_default_client(
                 "model",
                 DEFAULT_OPENAI_MODEL,
             ),
+            provider_name=provider_name,
             timeout=timeout,
         )
 
@@ -186,6 +187,7 @@ def build_default_client(
                 "model",
                 DEFAULT_ANTHROPIC_MODEL,
             ),
+            provider_name=provider_name,
             timeout=timeout,
             anthropic_version=_config_string(
                 provider_config,
@@ -212,6 +214,7 @@ def build_default_client(
                 "model",
                 DEFAULT_OPENAI_MODEL,
             ),
+            provider_name=provider_name,
             timeout=timeout,
         )
 
@@ -232,11 +235,13 @@ class OpenAIResponsesClient:
         api_key: str,
         base_url: str = DEFAULT_OPENAI_BASE_URL,
         default_model: str = DEFAULT_OPENAI_MODEL,
+        provider_name: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.default_model = default_model
+        self.provider_name = provider_name
         self.timeout = timeout
 
     def chat(self, messages: list[ChatMessage | dict], **kwargs: Any) -> ChatResponse:
@@ -316,11 +321,13 @@ class OpenAIChatCompletionsClient:
         api_key: str,
         base_url: str = DEFAULT_OPENAI_BASE_URL,
         default_model: str = DEFAULT_OPENAI_MODEL,
+        provider_name: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.default_model = default_model
+        self.provider_name = provider_name
         self.timeout = timeout
 
     def chat(self, messages: list[ChatMessage | dict], **kwargs: Any) -> ChatResponse:
@@ -390,12 +397,14 @@ class AnthropicMessagesClient:
         api_key: str,
         base_url: str = DEFAULT_ANTHROPIC_BASE_URL,
         default_model: str = DEFAULT_ANTHROPIC_MODEL,
+        provider_name: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         anthropic_version: str = DEFAULT_ANTHROPIC_VERSION,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.default_model = default_model
+        self.provider_name = provider_name
         self.timeout = timeout
         self.anthropic_version = anthropic_version
 

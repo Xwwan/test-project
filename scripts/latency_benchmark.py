@@ -284,7 +284,9 @@ def _model_client_metadata(client: ModelClient | None) -> tuple[str | None, str 
     model = getattr(client, "default_model", None)
     if not isinstance(model, str) or not model:
         model = getattr(client, "model", None)
-    provider = getattr(client, "provider", None)
+    provider = getattr(client, "provider_name", None)
+    if not isinstance(provider, str) or not provider:
+        provider = getattr(client, "provider", None)
     return (
         model if isinstance(model, str) and model else None,
         provider if isinstance(provider, str) and provider else None,
