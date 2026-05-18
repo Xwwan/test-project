@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import re
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -608,7 +608,7 @@ def build_app(
     dependencies: DialogueDependencies | None = None,
     audio_dependencies: AudioDependencies | None = None,
     live_asr_manager: LiveAsrSessionManager | None = None,
-    server_class: Callable[..., HTTPServer] = HTTPServer,
+    server_class: Callable[..., HTTPServer] = ThreadingHTTPServer,
 ) -> HTTPServer:
     """Build (but do not start) an :class:`HTTPServer` ready to serve the API."""
 

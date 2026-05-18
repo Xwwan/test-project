@@ -68,8 +68,8 @@
 约定：
 
 - `request_id` / `turn_id` 由 Request Coordinator 生成，绑定整次请求。
-- MVP 始终同步完成 retrieval，因此 `retrieval_status` 当前总是
-  `completed`；保留字段以便后续切异步。
+- 非流式 `/chat` 当前同步完成 retrieval，因此成功响应中的
+  `retrieval_status` 通常为 `completed`。
 - 成功后请求状态进入 `retrieval_completed`，会出现在
   `/followups/pending` 列表里，直到调用 `/followups/{request_id}/run`。
 
@@ -96,7 +96,7 @@ event: delta
 data: {"delta":"回复片段"}
 
 event: done
-data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"string","reply":"完整回复","retrieval_status":"completed","retrieved_memory_ids":[int]}
+data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"string","reply":"完整回复","retrieval_status":"pending","retrieved_memory_ids":[]}
 ```
 
 约定：
@@ -104,10 +104,12 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 - `meta` 会在模型开始生成前返回，便于客户端提前绑定 `request_id` 与
   `turn_id`。
 - `delta` 可出现多次，每次只包含新增文本片段。
-- `done` 的 `data` 与 `/chat` 成功响应字段一致，并包含聚合后的完整
+- `done` 表示首条回复已经完整生成并保存，`data` 包含聚合后的完整
   `reply`。
-- 服务端会在完整首条回复生成后继续保存 assistant turn 并同步执行
-  retrieval，因此 `done` 事件可能晚于最后一个 `delta`。
+- 流式接口的 retrieval 默认在后台继续执行，因此 `done.data.retrieval_status`
+  通常为 `pending`，`retrieved_memory_ids` 在该事件中为空数组。
+- 后台 retrieval 完成后，请求会进入 `/followups/pending`，客户端可按需
+  调用 `/followups/{request_id}/run`。
 - 如果流式过程中出错，服务端发送：
 
 ```text
@@ -321,7 +323,7 @@ event: delta
 data: {"delta":"回复片段"}
 
 event: done
-data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"voice-latency-demo","reply":"完整回复","retrieval_status":"completed","retrieved_memory_ids":[],"transcript":"最终识别文本","audio_base64":null,"audio_format":"pcm"}
+data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"voice-latency-demo","reply":"完整回复","retrieval_status":"pending","retrieved_memory_ids":[],"transcript":"最终识别文本","audio_base64":null,"audio_format":"pcm"}
 ```
 
 约定：

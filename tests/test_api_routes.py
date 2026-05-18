@@ -6,11 +6,15 @@ A single fake dependency container drives the underlying dialogue service.
 
 from __future__ import annotations
 
+import io
+import json
+import inspect
+from http.server import ThreadingHTTPServer
 from typing import Any
 
 import unittest
 
-from src.api.routes import dispatch
+from src.api.routes import ChatRequestHandler, build_app, dispatch
 from src.coordinator import request_coordinator
 from src.services import DialogueDependencies
 
@@ -123,6 +127,41 @@ class ApiRoutesTest(unittest.TestCase):
         assert body["conversation_id"] == "conv-1"
         assert body["request_id"].startswith("req_")
         assert body["retrieval_status"] == "completed"
+
+    def test_chat_stream_sse_done_reports_pending_retrieval(self) -> None:
+        memory = FakeMemoryStore(lightweight=[{"id": 1, "summary": "x"}])
+        deps, _, _ = _build_dependencies(memory_store=memory, selected_ids=[1])
+        handler = _FakeStreamHandler(deps)
+
+        ChatRequestHandler._write_chat_stream(
+            handler,
+            {"conversation_id": "conv-1", "message": "你好"},
+        )
+
+        body = handler.wfile.getvalue().decode("utf-8")
+        events = _parse_sse_events(body)
+        assert [event["event"] for event in events] == ["meta", "delta", "done"]
+        assert events[-1]["data"]["reply"] == "你好"
+        assert events[-1]["data"]["retrieval_status"] == "pending"
+        assert events[-1]["data"]["retrieved_memory_ids"] == []
+
+    def test_build_app_defaults_to_threading_http_server(self) -> None:
+        default = inspect.signature(build_app).parameters["server_class"].default
+        assert default is ThreadingHTTPServer
+
+    def test_build_app_accepts_custom_server_class(self) -> None:
+        captured: dict[str, Any] = {}
+
+        class FakeServer:
+            def __init__(self, address: tuple[str, int], handler_cls: type) -> None:
+                captured["address"] = address
+                captured["handler_cls"] = handler_cls
+
+        server = build_app("127.0.0.1", 1234, server_class=FakeServer)
+
+        assert isinstance(server, FakeServer)
+        assert captured["address"] == ("127.0.0.1", 1234)
+        assert captured["handler_cls"].injected_dependencies is None
 
 
     def test_post_chat_validates_body(self) -> None:
@@ -245,3 +284,41 @@ class ApiRoutesTest(unittest.TestCase):
         deps, _, _ = _build_dependencies()
         status, body = dispatch("PUT", "/chat", {}, dependencies=deps)
         assert status == 404
+
+
+def _parse_sse_events(payload: str) -> list[dict[str, Any]]:
+    events = []
+    for frame in payload.strip().split("\n\n"):
+        event_name = None
+        data = None
+        for line in frame.splitlines():
+            if line.startswith("event: "):
+                event_name = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data = json.loads(line.removeprefix("data: "))
+        if event_name is not None and data is not None:
+            events.append({"event": event_name, "data": data})
+    return events
+
+
+class _FakeStreamHandler:
+    _write_sse_event = ChatRequestHandler._write_sse_event
+
+    def __init__(self, dependencies: DialogueDependencies) -> None:
+        type(self).injected_dependencies = dependencies
+        self.status: int | None = None
+        self.headers: list[tuple[str, str]] = []
+        self.wfile = io.BytesIO()
+
+    def send_response(self, status: int) -> None:
+        self.status = status
+
+    def send_header(self, key: str, value: str) -> None:
+        self.headers.append((key, value))
+
+    def end_headers(self) -> None:
+        return None
+
+    def _write_json(self, status: int, body: dict) -> None:
+        self.status = status
+        self.wfile.write(json.dumps(body).encode("utf-8"))

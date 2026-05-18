@@ -17,6 +17,7 @@ Public entry points:
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator
 
@@ -225,7 +226,7 @@ def handle_chat_message_stream(
         _save_assistant_turn(deps, conversation_id, reply_text, kind="initial")
 
         request_coordinator.mark_retrieval_pending(request_id)
-        retrieval_status, retrieved_items = _run_retrieval(
+        _run_retrieval_in_background(
             deps=deps,
             request_id=request_id,
             user_message=message,
@@ -233,7 +234,6 @@ def handle_chat_message_stream(
             recent_history=recent_history,
             user_profile=user_profile,
         )
-        request_coordinator.mark_retrieval_completed(request_id, retrieved_items)
     except Exception as exc:
         request_coordinator.mark_failed(request_id, str(exc) or exc.__class__.__name__)
         raise
@@ -245,8 +245,8 @@ def handle_chat_message_stream(
             "turn_id": turn_id,
             "conversation_id": conversation_id,
             "reply": reply_text,
-            "retrieval_status": retrieval_status,
-            "retrieved_memory_ids": [item.get("id") for item in retrieved_items],
+            "retrieval_status": RETRIEVAL_STATUS_PENDING,
+            "retrieved_memory_ids": [],
         },
     }
 
@@ -386,6 +386,40 @@ def _run_retrieval(
     if not isinstance(full_items, list):
         raise TypeError("get_memory_items_by_ids must return a list")
     return RETRIEVAL_STATUS_COMPLETED, list(full_items)
+
+
+def _run_retrieval_in_background(
+    *,
+    deps: DialogueDependencies,
+    request_id: str,
+    user_message: str,
+    compact_history: str,
+    recent_history: list[dict],
+    user_profile: str,
+) -> None:
+    def _worker() -> None:
+        try:
+            _, retrieved_items = _run_retrieval(
+                deps=deps,
+                request_id=request_id,
+                user_message=user_message,
+                compact_history=compact_history,
+                recent_history=list(recent_history),
+                user_profile=user_profile,
+            )
+            request_coordinator.mark_retrieval_completed(request_id, retrieved_items)
+        except Exception as exc:  # pragma: no cover - defensive background guard
+            request_coordinator.mark_failed(
+                request_id,
+                str(exc) or exc.__class__.__name__,
+            )
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"memory-retrieval-{request_id}",
+        daemon=True,
+    )
+    thread.start()
 
 
 def _require_reply_text(initial: Any) -> str:

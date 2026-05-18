@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 import unittest
@@ -182,6 +184,15 @@ def _build_deps(
     )
 
 
+def _wait_until(predicate, *, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition was not met before timeout")
+
+
 # ---------------------------------------------------------------------------
 # handle_chat_message
 # ---------------------------------------------------------------------------
@@ -249,11 +260,65 @@ class DialogueServiceTest(unittest.TestCase):
         assert events[1]["data"] == {"delta": "你"}
         assert events[2]["data"] == {"delta": "好"}
         assert events[-1]["data"]["reply"] == "你好"
-        assert events[-1]["data"]["retrieved_memory_ids"] == [2]
+        assert events[-1]["data"]["retrieval_status"] == "pending"
+        assert events[-1]["data"]["retrieved_memory_ids"] == []
         assert [turn["role"] for _, turn in convo.turns] == ["user", "assistant"]
         assert convo.turns[-1][1]["content"] == "你好"
         assert initial_stream.last_input is not None
         assert initial_stream.last_input["current_query"] == "你好"
+
+        request_id = events[-1]["data"]["request_id"]
+        _wait_until(
+            lambda: request_coordinator.get_request(request_id)["status"]
+            == "retrieval_completed"
+        )
+        record = request_coordinator.get_request(request_id)
+        assert [item["id"] for item in record["retrieved_items"]] == [2]
+
+    def test_handle_chat_message_stream_done_does_not_wait_for_retrieval(self) -> None:
+        retrieval_started = threading.Event()
+        allow_retrieval_finish = threading.Event()
+        retrieval_finished = threading.Event()
+        memory = FakeMemoryStore(lightweight=[{"id": 7, "summary": "x"}])
+
+        def slow_retrieval(**kwargs: Any) -> dict:
+            retrieval_started.set()
+            if not allow_retrieval_finish.wait(timeout=2):
+                raise AssertionError("retrieval was not released")
+            retrieval_finished.set()
+            return {
+                "request_id": kwargs["request_id"],
+                "selected_memory_ids": [7],
+            }
+
+        deps = _build_deps(
+            memory_store=memory,
+            initial_reply_stream_fn=RecordingInitialReplyStreamFn(chunks=["好"]),
+            retrieval_fn=slow_retrieval,
+        )
+
+        events = list(handle_chat_message_stream("conv-1", "你好", dependencies=deps))
+
+        assert [event["event"] for event in events] == ["meta", "delta", "done"]
+        assert events[-1]["data"]["retrieval_status"] == "pending"
+        assert events[-1]["data"]["retrieved_memory_ids"] == []
+        assert retrieval_started.wait(timeout=1)
+        assert not retrieval_finished.is_set()
+
+        request_id = events[-1]["data"]["request_id"]
+        assert request_coordinator.get_request(request_id)["status"] == "retrieval_pending"
+
+        allow_retrieval_finish.set()
+        _wait_until(
+            lambda: request_coordinator.get_request(request_id)["status"]
+            == "retrieval_completed"
+        )
+        assert retrieval_finished.is_set()
+        pending_ids = [
+            record["request_id"]
+            for record in request_coordinator.get_pending_followup_requests()
+        ]
+        assert request_id in pending_ids
 
     def test_handle_chat_message_stream_falls_back_to_one_shot_reply(self) -> None:
         deps = _build_deps(initial_reply_fn=RecordingInitialReplyFn(reply="完整回复"))
@@ -263,6 +328,7 @@ class DialogueServiceTest(unittest.TestCase):
         assert [event["event"] for event in events] == ["meta", "delta", "done"]
         assert events[1]["data"] == {"delta": "完整回复"}
         assert events[-1]["data"]["reply"] == "完整回复"
+        assert events[-1]["data"]["retrieval_status"] == "pending"
 
     def test_handle_chat_message_runs_retrieval_when_lightweight_items_exist(self) -> None:
         memory = FakeMemoryStore(
