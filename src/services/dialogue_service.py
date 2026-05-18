@@ -18,7 +18,7 @@ Public entry points:
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from src.coordinator import request_coordinator
 
@@ -56,6 +56,7 @@ class DialogueDependencies:
     apply_memory_operations: Callable[[list[dict]], list[dict]] | None = None
     # Person 2 — dialogue + retrieval agents
     generate_initial_reply: Callable[..., dict] | None = None
+    generate_initial_reply_stream: Callable[..., Iterator[str]] | None = None
     generate_followup_reply: Callable[..., dict] | None = None
     retrieve_relevant_memory_ids: Callable[..., dict] | None = None
     # Person 3 — memory curator
@@ -154,6 +155,99 @@ def handle_chat_message(
         "reply": reply_text,
         "retrieval_status": retrieval_status,
         "retrieved_memory_ids": [item.get("id") for item in retrieved_items],
+    }
+
+
+def handle_chat_message_stream(
+    conversation_id: str,
+    message: str,
+    *,
+    dependencies: DialogueDependencies | None = None,
+) -> Iterator[dict]:
+    """Run ``/chat`` orchestration while yielding the initial reply as deltas.
+
+    Events are JSON-serializable dictionaries with ``event`` and ``data`` keys.
+    The final ``done`` event has the same payload shape as ``handle_chat_message``.
+    """
+
+    if not isinstance(conversation_id, str) or not conversation_id:
+        raise ValueError("conversation_id must be a non-empty string")
+    if not isinstance(message, str) or not message:
+        raise ValueError("message must be a non-empty string")
+
+    deps = (dependencies or DialogueDependencies()).resolved()
+    request_record = request_coordinator.create_request(conversation_id, message)
+    request_id = request_record["request_id"]
+    turn_id = request_record["turn_id"]
+    reply_parts: list[str] = []
+
+    try:
+        _save_user_turn(deps, conversation_id, turn_id, message)
+        model_profile = deps.read_model_profile()
+        user_profile = deps.read_user_profile()
+        compact_history = deps.get_compact_history(conversation_id)
+        recent_history = deps.get_recent_history(
+            conversation_id, deps.recent_history_limit
+        )
+
+        yield {
+            "event": "meta",
+            "data": {
+                "request_id": request_id,
+                "turn_id": turn_id,
+                "conversation_id": conversation_id,
+            },
+        }
+
+        stream = deps.generate_initial_reply_stream(
+            {
+                "request_id": request_id,
+                "model_profile": model_profile,
+                "user_profile": user_profile,
+                "compact_history": compact_history,
+                "recent_history": recent_history,
+                "current_query": message,
+            },
+            model_client=deps.model_client,
+        )
+        for delta in stream:
+            if not isinstance(delta, str):
+                raise TypeError("generate_initial_reply_stream must yield strings")
+            if not delta:
+                continue
+            reply_parts.append(delta)
+            yield {"event": "delta", "data": {"delta": delta}}
+
+        reply_text = "".join(reply_parts).strip()
+        if not reply_text:
+            raise ValueError("generate_initial_reply_stream must produce a non-empty reply")
+        request_coordinator.mark_initial_reply(request_id, reply_text)
+        _save_assistant_turn(deps, conversation_id, reply_text, kind="initial")
+
+        request_coordinator.mark_retrieval_pending(request_id)
+        retrieval_status, retrieved_items = _run_retrieval(
+            deps=deps,
+            request_id=request_id,
+            user_message=message,
+            compact_history=compact_history,
+            recent_history=recent_history,
+            user_profile=user_profile,
+        )
+        request_coordinator.mark_retrieval_completed(request_id, retrieved_items)
+    except Exception as exc:
+        request_coordinator.mark_failed(request_id, str(exc) or exc.__class__.__name__)
+        raise
+
+    yield {
+        "event": "done",
+        "data": {
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "conversation_id": conversation_id,
+            "reply": reply_text,
+            "retrieval_status": retrieval_status,
+            "retrieved_memory_ids": [item.get("id") for item in retrieved_items],
+        },
     }
 
 
@@ -348,19 +442,31 @@ def _resolve(deps: DialogueDependencies) -> DialogueDependencies:
     """Fill in missing collaborators with lazy-imported real implementations."""
 
     overrides: dict[str, Any] = {}
+    if deps.generate_initial_reply_stream is None and deps.generate_initial_reply is not None:
+        overrides["generate_initial_reply_stream"] = _stream_from_one_shot_reply(
+            deps.generate_initial_reply
+        )
     for field_name in _PERSON_1_RESOLVERS:
-        if getattr(deps, field_name) is None:
+        if getattr(deps, field_name) is None and field_name not in overrides:
             overrides[field_name] = _PERSON_1_RESOLVERS[field_name]()
     for field_name in _PERSON_2_RESOLVERS:
-        if getattr(deps, field_name) is None:
+        if getattr(deps, field_name) is None and field_name not in overrides:
             overrides[field_name] = _PERSON_2_RESOLVERS[field_name]()
     for field_name in _PERSON_3_RESOLVERS:
-        if getattr(deps, field_name) is None:
+        if getattr(deps, field_name) is None and field_name not in overrides:
             overrides[field_name] = _PERSON_3_RESOLVERS[field_name]()
 
     if not overrides:
         return deps
     return deps.with_overrides(**overrides)
+
+
+def _stream_from_one_shot_reply(generate_initial_reply: Callable[..., dict]) -> Callable[..., Iterator[str]]:
+    def _wrapped(input_data: dict, **kwargs: Any) -> Iterator[str]:
+        reply = _require_reply_text(generate_initial_reply(input_data, **kwargs))
+        yield reply
+
+    return _wrapped
 
 
 def _resolve_persona() -> dict:
@@ -414,6 +520,7 @@ def _resolve_dialogue_agent() -> dict:
     from src.agents.dialogue_agent import (  # type: ignore
         generate_followup_reply,
         generate_initial_reply,
+        generate_initial_reply_stream,
     )
     from src.agents.memory_retrieval_workflow import (  # type: ignore
         retrieve_relevant_memory_ids,
@@ -421,6 +528,7 @@ def _resolve_dialogue_agent() -> dict:
 
     return {
         "generate_initial_reply": generate_initial_reply,
+        "generate_initial_reply_stream": generate_initial_reply_stream,
         "generate_followup_reply": generate_followup_reply,
         "retrieve_relevant_memory_ids": retrieve_relevant_memory_ids,
     }
@@ -428,6 +536,9 @@ def _resolve_dialogue_agent() -> dict:
 
 _PERSON_2_RESOLVERS: dict[str, Callable[[], Any]] = {
     "generate_initial_reply": lambda: _resolve_dialogue_agent()["generate_initial_reply"],
+    "generate_initial_reply_stream": lambda: _resolve_dialogue_agent()[
+        "generate_initial_reply_stream"
+    ],
     "generate_followup_reply": lambda: _resolve_dialogue_agent()["generate_followup_reply"],
     "retrieve_relevant_memory_ids": lambda: _resolve_dialogue_agent()[
         "retrieve_relevant_memory_ids"

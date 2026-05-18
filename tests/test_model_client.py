@@ -9,6 +9,7 @@ from src.models import (
     OpenAIChatCompletionsClient,
     OpenAIResponsesClient,
     chat_once,
+    chat_stream,
 )
 
 
@@ -49,6 +50,38 @@ class ModelClientTest(unittest.TestCase):
     def test_chat_once_requires_non_empty_messages(self):
         with self.assertRaises(ValueError):
             chat_once([], client=RecordingClient())
+
+    def test_chat_stream_falls_back_to_one_shot_client(self):
+        client = RecordingClient()
+
+        chunks = list(
+            chat_stream(
+                [ChatMessage(role="user", content="Hello")],
+                client=client,
+            )
+        )
+
+        self.assertEqual(chunks, ["model reply"])
+
+    def test_chat_stream_uses_client_stream_method(self):
+        class StreamingClient(RecordingClient):
+            def chat_stream(self, messages, **kwargs):
+                self.calls.append({"messages": messages, "kwargs": kwargs})
+                yield "你"
+                yield "好"
+
+        client = StreamingClient()
+
+        chunks = list(
+            chat_stream(
+                [ChatMessage(role="user", content="Hello")],
+                client=client,
+                model="fake-model",
+            )
+        )
+
+        self.assertEqual(chunks, ["你", "好"])
+        self.assertEqual(client.calls[0]["kwargs"]["model"], "fake-model")
 
     def test_chat_message_rejects_unsupported_roles(self):
         with self.assertRaises(ValueError):
@@ -244,6 +277,24 @@ routes:
         )
         self.assertEqual(captured["headers"]["Authorization"], "Bearer key")
 
+    def test_openai_responses_client_streams_text_deltas(self):
+        captured = {}
+
+        def fake_post_json_stream(url, payload, *, headers, timeout):
+            captured.update({"url": url, "payload": payload, "headers": headers})
+            yield {"type": "response.output_text.delta", "delta": "你"}
+            yield {"type": "response.output_text.delta", "delta": "好"}
+            yield {"type": "response.completed"}
+
+        client = OpenAIResponsesClient(api_key="key", base_url="https://api.example/v1")
+
+        with patch("src.models.chat._post_json_stream", fake_post_json_stream):
+            chunks = list(client.chat_stream([ChatMessage(role="user", content="Hello")]))
+
+        self.assertEqual(chunks, ["你", "好"])
+        self.assertEqual(captured["url"], "https://api.example/v1/responses")
+        self.assertIs(captured["payload"]["stream"], True)
+
     def test_provider_clients_accept_dict_messages(self):
         captured = {}
 
@@ -265,6 +316,26 @@ routes:
             captured["payload"]["messages"],
             [{"role": "user", "content": "Return JSON"}],
         )
+
+    def test_openai_compatible_client_streams_delta_content(self):
+        captured = {}
+
+        def fake_post_json_stream(url, payload, *, headers, timeout):
+            captured.update({"url": url, "payload": payload})
+            yield {"choices": [{"delta": {"content": "你"}}]}
+            yield {"choices": [{"delta": {"content": "好"}}]}
+
+        client = OpenAIChatCompletionsClient(
+            api_key="key",
+            base_url="https://api.example/v1",
+        )
+
+        with patch("src.models.chat._post_json_stream", fake_post_json_stream):
+            chunks = list(client.chat_stream([{"role": "user", "content": "Hello"}]))
+
+        self.assertEqual(chunks, ["你", "好"])
+        self.assertEqual(captured["url"], "https://api.example/v1/chat/completions")
+        self.assertIs(captured["payload"]["stream"], True)
 
     def test_anthropic_client_splits_system_prompt_and_uses_latest_default_model(self):
         captured = {}
@@ -306,6 +377,29 @@ routes:
             [{"role": "user", "content": "Hello"}],
         )
         self.assertEqual(captured["headers"]["x-api-key"], "key")
+
+    def test_anthropic_client_streams_text_deltas(self):
+        captured = {}
+
+        def fake_post_json_stream(url, payload, *, headers, timeout):
+            captured.update({"url": url, "payload": payload})
+            yield {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "你"},
+            }
+            yield {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "好"},
+            }
+
+        client = AnthropicMessagesClient(api_key="key", base_url="https://api.example")
+
+        with patch("src.models.chat._post_json_stream", fake_post_json_stream):
+            chunks = list(client.chat_stream([ChatMessage(role="user", content="Hello")]))
+
+        self.assertEqual(chunks, ["你", "好"])
+        self.assertEqual(captured["url"], "https://api.example/v1/messages")
+        self.assertIs(captured["payload"]["stream"], True)
 
     def _write_config(self, content: str):
         self.addCleanup(self._cleanup_config_files)

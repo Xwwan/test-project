@@ -12,6 +12,7 @@ from src.services import (
     apply_operations,
     curate_conversation_memory,
     handle_chat_message,
+    handle_chat_message_stream,
     handle_followup,
     refresh_user_profile,
 )
@@ -91,6 +92,18 @@ class RecordingInitialReplyFn:
         return {"request_id": input_data["request_id"], "reply": self.reply}
 
 
+class RecordingInitialReplyStreamFn:
+    """Behaves like Person 2's generate_initial_reply_stream."""
+
+    def __init__(self, chunks: list[str] | None = None) -> None:
+        self.chunks = chunks or ["hi", " there"]
+        self.last_input: dict | None = None
+
+    def __call__(self, input_data: dict, *, model_client: Any = None, **kwargs: Any):
+        self.last_input = input_data
+        yield from self.chunks
+
+
 class RecordingRetrievalFn:
     def __init__(self, selected_ids: list[int]) -> None:
         self.selected_ids = list(selected_ids)
@@ -123,6 +136,7 @@ def _build_deps(
     conversation_store: FakeConversationStore | None = None,
     memory_store: FakeMemoryStore | None = None,
     initial_reply_fn: Any = None,
+    initial_reply_stream_fn: Any = None,
     retrieval_fn: Any = None,
     followup_fn: Any = None,
     extract_fn: Any = None,
@@ -158,6 +172,7 @@ def _build_deps(
         get_memory_items_by_ids=memory_store.get_memory_items_by_ids,
         apply_memory_operations=memory_store.apply_memory_operations,
         generate_initial_reply=initial_reply_fn,
+        generate_initial_reply_stream=initial_reply_stream_fn,
         generate_followup_reply=followup_fn,
         retrieve_relevant_memory_ids=retrieval_fn,
         extract_memory_operations=extract_fn,
@@ -216,6 +231,38 @@ class DialogueServiceTest(unittest.TestCase):
         assert assistant_turn["content"] == response["reply"]
         assert assistant_turn["metadata_json"]["turn_kind"] == "initial"
 
+    def test_handle_chat_message_stream_yields_deltas_and_final_payload(self) -> None:
+        convo = FakeConversationStore()
+        memory = FakeMemoryStore(lightweight=[{"id": 2, "summary": "x"}])
+        initial_stream = RecordingInitialReplyStreamFn(chunks=["你", "好"])
+        retrieval = RecordingRetrievalFn(selected_ids=[2])
+        deps = _build_deps(
+            conversation_store=convo,
+            memory_store=memory,
+            initial_reply_stream_fn=initial_stream,
+            retrieval_fn=retrieval,
+        )
+
+        events = list(handle_chat_message_stream("conv-1", "你好", dependencies=deps))
+
+        assert [event["event"] for event in events] == ["meta", "delta", "delta", "done"]
+        assert events[1]["data"] == {"delta": "你"}
+        assert events[2]["data"] == {"delta": "好"}
+        assert events[-1]["data"]["reply"] == "你好"
+        assert events[-1]["data"]["retrieved_memory_ids"] == [2]
+        assert [turn["role"] for _, turn in convo.turns] == ["user", "assistant"]
+        assert convo.turns[-1][1]["content"] == "你好"
+        assert initial_stream.last_input is not None
+        assert initial_stream.last_input["current_query"] == "你好"
+
+    def test_handle_chat_message_stream_falls_back_to_one_shot_reply(self) -> None:
+        deps = _build_deps(initial_reply_fn=RecordingInitialReplyFn(reply="完整回复"))
+
+        events = list(handle_chat_message_stream("conv-1", "你好", dependencies=deps))
+
+        assert [event["event"] for event in events] == ["meta", "delta", "done"]
+        assert events[1]["data"] == {"delta": "完整回复"}
+        assert events[-1]["data"]["reply"] == "完整回复"
 
     def test_handle_chat_message_runs_retrieval_when_lightweight_items_exist(self) -> None:
         memory = FakeMemoryStore(

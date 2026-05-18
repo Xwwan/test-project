@@ -46,6 +46,7 @@ from src.services import (
     DialogueDependencies,
     curate_conversation_memory,
     handle_chat_message,
+    handle_chat_message_stream,
     handle_followup,
     refresh_user_profile,
 )
@@ -445,6 +446,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             body = self._read_json_body()
             if body is _BODY_ERROR:
                 return
+            if urlsplit(self.path).path == "/chat/stream":
+                self._write_chat_stream(body)
+                return
 
         status, response_body = dispatch(
             method,
@@ -455,6 +459,34 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             live_asr_manager=type(self).injected_live_asr_manager,
         )
         self._write_json(status, response_body)
+
+    def _write_chat_stream(self, body: Any) -> None:
+        try:
+            request = ChatRequest.from_dict(body or {})
+        except SchemaError as exc:
+            self._write_json(400, {"error": {"message": str(exc)}})
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        try:
+            for item in handle_chat_message_stream(
+                request.conversation_id,
+                request.message,
+                dependencies=type(self).injected_dependencies,
+            ):
+                event = item.get("event", "message")
+                data = item.get("data", {})
+                self._write_sse_event(event, data)
+        except Exception as exc:  # pragma: no cover - defensive network path
+            self._write_sse_event(
+                "error",
+                {"message": str(exc) or exc.__class__.__name__},
+            )
 
     def _read_json_body(self) -> Any:
         length = int(self.headers.get("Content-Length") or 0)
@@ -476,6 +508,12 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _write_sse_event(self, event: str, data: dict) -> None:
+        payload = json.dumps(data, ensure_ascii=False)
+        frame = f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
+        self.wfile.write(frame)
+        self.wfile.flush()
 
     def _write_html_file(self, path: Path) -> None:
         try:

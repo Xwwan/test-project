@@ -12,6 +12,7 @@
 | Method | Path | 描述 |
 | --- | --- | --- |
 | `POST` | `/chat` | 处理一条用户消息，返回首条回复 |
+| `POST` | `/chat/stream` | 处理一条用户消息，以 SSE 流式返回首条回复 |
 | `POST` | `/voice/chat` | 处理一段用户语音，返回识别文本、首条回复和可选语音 |
 | `POST` | `/voice/live/start` | 开始实时语音识别会话 |
 | `POST` | `/voice/live/chunk` | 向实时语音识别会话提交一段 PCM 音频 |
@@ -73,7 +74,49 @@
 
 ---
 
-## 3. `POST /voice/chat`
+## 3. `POST /chat/stream`
+
+请求与 `/chat` 相同：
+
+```json
+{
+  "conversation_id": "string",
+  "message": "string"
+}
+```
+
+响应为 `text/event-stream; charset=utf-8`，事件顺序：
+
+```text
+event: meta
+data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"string"}
+
+event: delta
+data: {"delta":"回复片段"}
+
+event: done
+data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"string","reply":"完整回复","retrieval_status":"completed","retrieved_memory_ids":[int]}
+```
+
+约定：
+
+- `meta` 会在模型开始生成前返回，便于客户端提前绑定 `request_id` 与
+  `turn_id`。
+- `delta` 可出现多次，每次只包含新增文本片段。
+- `done` 的 `data` 与 `/chat` 成功响应字段一致，并包含聚合后的完整
+  `reply`。
+- 服务端会在完整首条回复生成后继续保存 assistant turn 并同步执行
+  retrieval，因此 `done` 事件可能晚于最后一个 `delta`。
+- 如果流式过程中出错，服务端发送：
+
+```text
+event: error
+data: {"message":"human readable reason"}
+```
+
+---
+
+## 4. `POST /voice/chat`
 
 请求：
 
@@ -110,7 +153,7 @@
 
 ---
 
-## 4. 实时语音接口
+## 5. 实时语音接口
 
 实时语音接口面向 Reachy app 一类的外部采集端：采集端负责录音、降采样和分块；
 `test-project` 负责持有火山 ASR WebSocket、维护实时字幕，并在结束时复用现有
@@ -123,7 +166,7 @@
 - 服务端接受最后一个普通 chunk 小于 `5120` bytes。
 - 停止录音时应调用 `/voice/live/finish`，不要再次把整段音频发到 `/voice/chat`。
 
-### 4.1 `POST /voice/live/start`
+### 5.1 `POST /voice/live/start`
 
 请求体可省略；默认值如下：
 
@@ -153,7 +196,7 @@
 - 当前只接受 `sample_rate=16000`、`channels=1`、`audio_format=pcm`。
 - 成功响应表示服务端已创建实时 ASR 会话，并已发送火山 ASR full client request。
 
-### 4.2 `POST /voice/live/chunk`
+### 5.2 `POST /voice/live/chunk`
 
 请求：
 
@@ -179,7 +222,7 @@
 - `audio_base64` 必须是合法且非空的 base64。
 - 第一阶段推荐 `is_final=false`，统一由 `/voice/live/finish` 发送 ASR final packet。
 
-### 4.3 `GET /voice/live/transcript?session_id=...`
+### 5.3 `GET /voice/live/transcript?session_id=...`
 
 响应：
 
@@ -197,7 +240,7 @@
 - 采集端可以每 200-300ms 轮询一次。
 - `error` 非空时表示 ASR 会话已出现可展示错误，采集端应停止继续提交 chunk。
 
-### 4.4 `POST /voice/live/finish`
+### 5.4 `POST /voice/live/finish`
 
 请求：
 
@@ -231,7 +274,7 @@
 - 拿到最终 `transcript` 后直接复用现有文本对话和 TTS 流程，不再二次 STT。
 - finish 成功或失败后，该 live session 都会从内存 manager 中移除。
 
-### 4.5 `POST /voice/live/abort`
+### 5.5 `POST /voice/live/abort`
 
 请求：
 
@@ -254,7 +297,7 @@
 
 ---
 
-## 5. `GET /followups/pending`
+## 6. `GET /followups/pending`
 
 响应：
 
@@ -273,7 +316,7 @@
 
 ---
 
-## 6. `POST /followups/{request_id}/run`
+## 7. `POST /followups/{request_id}/run`
 
 请求体可省略或为 `{}`。
 
@@ -298,7 +341,7 @@
 
 ---
 
-## 7. `POST /memory/curate`
+## 8. `POST /memory/curate`
 
 请求：
 
@@ -329,11 +372,11 @@
 
 - `operations` 即 Memory Curator 调用 LLM 后归一化得到的列表；为空时
   `applied` 也为空。
-- `payload` 字段集合见下方第 8 节。
+- `payload` 字段集合见下方第 9 节。
 
 ---
 
-## 8. Memory Curator 输出 schema
+## 9. Memory Curator 输出 schema
 
 参考 `docs/tasks/person-3-orchestration-curator.md` 第 5.3 节。Person 3
 归一化后保证：
@@ -370,7 +413,7 @@
 
 ---
 
-## 9. `POST /memory/profile/refresh`
+## 10. `POST /memory/profile/refresh`
 
 请求体为空 `{}`。
 
@@ -398,7 +441,7 @@
 
 ---
 
-## 10. Request Coordinator 内部状态机
+## 11. Request Coordinator 内部状态机
 
 ```
 received
@@ -414,7 +457,7 @@ failed                          (任意阶段失败)
 
 ---
 
-## 11. Dialogue Service 对 Person 1 / Person 2 的依赖
+## 12. Dialogue Service 对 Person 1 / Person 2 的依赖
 
 所有依赖通过 `DialogueDependencies` 注入，包括但不限于：
 
@@ -422,8 +465,8 @@ failed                          (任意阶段失败)
   `append_turn`、`get_recent_history`、`get_compact_history`、
   `update_compact_history`、`list_lightweight_memory_items`、
   `get_memory_items_by_ids`、`apply_memory_operations`。
-- Person 2：`generate_initial_reply`、`generate_followup_reply`、
-  `retrieve_relevant_memory_ids`。
+- Person 2：`generate_initial_reply`、`generate_initial_reply_stream`、
+  `generate_followup_reply`、`retrieve_relevant_memory_ids`。
 - Person 3：`extract_memory_operations`、`generate_user_profile_patch`、
   `model_client`（任何符合 Person 2 `ModelClient` Protocol 的对象）。
 

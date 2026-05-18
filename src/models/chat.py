@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 from urllib import error, request
 
 from src.utils.config import load_app_config
@@ -88,6 +88,37 @@ def chat_once(
     route_kwargs = _route_chat_kwargs(config_path, route) if route else {}
     active_client = client or build_default_client(config_path=config_path, route=route)
     return active_client.chat(normalized, **{**route_kwargs, **kwargs})
+
+
+def chat_stream(
+    messages: list[ChatMessage | dict],
+    *,
+    client: ModelClient | None = None,
+    route: str | None = None,
+    config_path: str | Path | None = None,
+    **kwargs: Any,
+) -> Iterator[str]:
+    """Yield text deltas from one streaming chat completion.
+
+    Injected test clients may implement ``chat_stream``. If they only implement
+    the one-shot ``chat`` method, this function falls back to yielding the full
+    response once so higher layers can keep one streaming code path.
+    """
+
+    normalized = [_coerce_message(message) for message in messages]
+    if not normalized:
+        raise ValueError("messages must contain at least one chat message")
+
+    route_kwargs = _route_chat_kwargs(config_path, route) if route else {}
+    active_client = client or build_default_client(config_path=config_path, route=route)
+    stream_method = getattr(active_client, "chat_stream", None)
+    if callable(stream_method):
+        yield from stream_method(normalized, **{**route_kwargs, **kwargs})
+        return
+
+    response = active_client.chat(normalized, **{**route_kwargs, **kwargs})
+    if response.content:
+        yield response.content
 
 
 def build_default_client(
@@ -242,6 +273,37 @@ class OpenAIResponsesClient:
             usage=raw.get("usage"),
         )
 
+    def chat_stream(self, messages: list[ChatMessage | dict], **kwargs: Any) -> Iterator[str]:
+        normalized = [_coerce_message(message) for message in messages]
+        model = kwargs.get("model") or self.default_model
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": [message.to_dict() for message in normalized],
+            "stream": True,
+        }
+
+        _copy_if_present(kwargs, payload, "temperature")
+        _copy_if_present(kwargs, payload, "max_output_tokens")
+        if "max_tokens" in kwargs and "max_output_tokens" not in payload:
+            payload["max_output_tokens"] = kwargs["max_tokens"]
+
+        response_format = kwargs.get("response_format")
+        if response_format:
+            payload["text"] = {"format": response_format}
+
+        for event in _post_json_stream(
+            f"{self.base_url}/responses",
+            payload,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=self.timeout,
+        ):
+            delta = _extract_openai_responses_stream_delta(event)
+            if delta:
+                yield delta
+
 
 class OpenAIChatCompletionsClient:
     """OpenAI-compatible Chat Completions adapter."""
@@ -289,6 +351,32 @@ class OpenAIChatCompletionsClient:
             provider=self.provider,
             usage=raw.get("usage"),
         )
+
+    def chat_stream(self, messages: list[ChatMessage | dict], **kwargs: Any) -> Iterator[str]:
+        normalized = [_coerce_message(message) for message in messages]
+        model = kwargs.get("model") or self.default_model
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [message.to_dict() for message in normalized],
+            "stream": True,
+        }
+
+        _copy_if_present(kwargs, payload, "temperature")
+        _copy_if_present(kwargs, payload, "max_tokens")
+        _copy_if_present(kwargs, payload, "response_format")
+
+        for event in _post_json_stream(
+            f"{self.base_url}/chat/completions",
+            payload,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=self.timeout,
+        ):
+            delta = _extract_chat_completions_stream_delta(event)
+            if delta:
+                yield delta
 
 
 class AnthropicMessagesClient:
@@ -343,6 +431,35 @@ class AnthropicMessagesClient:
             usage=raw.get("usage"),
         )
 
+    def chat_stream(self, messages: list[ChatMessage | dict], **kwargs: Any) -> Iterator[str]:
+        normalized = [_coerce_message(message) for message in messages]
+        model = kwargs.get("model") or self.default_model
+        system_text, anthropic_messages = _split_anthropic_messages(normalized)
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "max_tokens": kwargs.get("max_tokens") or kwargs.get("max_output_tokens") or 4096,
+            "messages": anthropic_messages,
+            "stream": True,
+        }
+        if system_text:
+            payload["system"] = system_text
+        _copy_if_present(kwargs, payload, "temperature")
+
+        for event in _post_json_stream(
+            f"{self.base_url}/v1/messages",
+            payload,
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": self.anthropic_version,
+                "Content-Type": "application/json",
+            },
+            timeout=self.timeout,
+        ):
+            delta = _extract_anthropic_stream_delta(event)
+            if delta:
+                yield delta
+
 
 def _coerce_message(message: ChatMessage | dict) -> ChatMessage:
     if isinstance(message, ChatMessage):
@@ -382,6 +499,43 @@ def _post_json(
     if not isinstance(decoded, dict):
         raise RuntimeError("model API returned a non-object JSON response")
     return decoded
+
+
+def _post_json_stream(
+    url: str,
+    payload: dict,
+    *,
+    headers: dict[str, str],
+    timeout: float,
+) -> Iterator[dict]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    http_request = request.Request(
+        url,
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with request.urlopen(http_request, timeout=timeout) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or line.startswith(":") or not line.startswith("data:"):
+                    continue
+                data = line.removeprefix("data:").strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    decoded = json.loads(data)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("model API returned invalid stream JSON") from exc
+                if not isinstance(decoded, dict):
+                    raise RuntimeError("model API returned a non-object stream event")
+                yield decoded
+    except error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"model API HTTP {exc.code}: {error_body}") from exc
+    except error.URLError as exc:
+        raise RuntimeError(f"model API request failed: {exc.reason}") from exc
 
 
 def _split_anthropic_messages(messages: list[ChatMessage]) -> tuple[str, list[dict]]:
@@ -434,6 +588,36 @@ def _extract_anthropic_text(raw: dict) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "".join(parts)
+
+
+def _extract_openai_responses_stream_delta(event: dict) -> str:
+    if event.get("type") == "response.output_text.delta":
+        delta = event.get("delta")
+        return delta if isinstance(delta, str) else ""
+    if event.get("type") == "response.content_part.delta":
+        delta = event.get("delta")
+        if isinstance(delta, dict):
+            text = delta.get("text")
+            return text if isinstance(text, str) else ""
+    return ""
+
+
+def _extract_chat_completions_stream_delta(event: dict) -> str:
+    try:
+        delta = event["choices"][0]["delta"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+    return delta if isinstance(delta, str) else ""
+
+
+def _extract_anthropic_stream_delta(event: dict) -> str:
+    if event.get("type") != "content_block_delta":
+        return ""
+    delta = event.get("delta")
+    if not isinstance(delta, dict) or delta.get("type") != "text_delta":
+        return ""
+    text = delta.get("text")
+    return text if isinstance(text, str) else ""
 
 
 def _copy_if_present(source: dict[str, Any], target: dict[str, Any], key: str) -> None:

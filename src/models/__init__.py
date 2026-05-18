@@ -1,7 +1,8 @@
-"""Single-step chat model adapters.
+"""Chat model adapters.
 
-The rest of the application should call :func:`chat_once` with fully prepared
-messages. Provider-specific HTTP details stay inside this package.
+The rest of the application should call :func:`chat_once` or
+:func:`chat_stream` with fully prepared messages. Provider-specific HTTP
+details stay inside this package.
 """
 
 from .chat import (
@@ -13,6 +14,7 @@ from .chat import (
     OpenAIResponsesClient,
     build_default_client,
     chat_once,
+    chat_stream,
 )
 
 __all__ = [
@@ -24,4 +26,5 @@ __all__ = [
     "OpenAIResponsesClient",
     "build_default_client",
     "chat_once",
+    "chat_stream",
 ]

@@ -11,7 +11,7 @@ from src.agents._prompting import (
     read_prompt,
     section,
 )
-from src.models import ChatMessage, ModelClient, chat_once
+from src.models import ChatMessage, ModelClient, chat_once, chat_stream
 
 
 DEFAULT_DIALOGUE_PROMPT = """You are the Dialogue Agent.
@@ -75,6 +75,29 @@ def generate_initial_reply(
         "request_id": request_id,
         "reply": response.content.strip(),
     }
+
+
+def generate_initial_reply_stream(
+    input_data: dict,
+    *,
+    model_client: ModelClient | None = None,
+    model: str | None = None,
+):
+    """Yield immediate user-facing reply text deltas through a streaming LLM."""
+
+    _validate_input_data(input_data)
+
+    prompt = read_prompt("dialogue_agent.md", DEFAULT_DIALOGUE_PROMPT)
+    messages = [
+        ChatMessage(role="system", content=prompt),
+        ChatMessage(role="user", content=_build_initial_context(input_data)),
+    ]
+    yield from chat_stream(
+        messages,
+        client=model_client,
+        route="dialogue.initial",
+        model=model,
+    )
 
 
 def generate_followup_reply(

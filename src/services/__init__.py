@@ -8,6 +8,7 @@ Memory Curator path.
 from .dialogue_service import (
     DialogueDependencies,
     handle_chat_message,
+    handle_chat_message_stream,
     handle_followup,
 )
 from .memory_service import (
@@ -21,6 +22,7 @@ __all__ = [
     "apply_operations",
     "curate_conversation_memory",
     "handle_chat_message",
+    "handle_chat_message_stream",
     "handle_followup",
     "refresh_user_profile",
 ]

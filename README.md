@@ -157,6 +157,20 @@ curl -s -X POST http://127.0.0.1:8000/chat \
   }'
 ```
 
+流式聊天消息使用 SSE：
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "conversation_id": "conv-demo-001",
+    "message": "你好，请流式回答一句话。"
+  }'
+```
+
+事件顺序为 `meta`、多次 `delta`、最后 `done`。`done` 里包含完整
+`reply`、`retrieval_status` 和 `retrieved_memory_ids`。
+
 发送语音聊天消息，`audio_base64` 当前约定为 16kHz、16-bit、mono PCM 的 base64：
 
 ```bash
