@@ -190,7 +190,7 @@
 <body>
   <main>
     <h1>语音延迟测试</h1>
-    <p>浏览器录音会以 16kHz PCM chunk 发送到实时 ASR；点击停止后，页面统计从结束输入到收到模型回复的耗时。</p>
+    <p>浏览器录音会以 16kHz PCM chunk 发送到实时 ASR；点击停止后，页面统计从结束输入到收到模型首个流式片段的耗时。</p>
 
     <section class="toolbar">
       <label>
@@ -204,7 +204,7 @@
 
     <div class="grid">
       <div class="metric"><span>录音时长</span><strong id="recordMs">0 ms</strong></div>
-      <div class="metric"><span>停止后到回复</span><strong id="replyMs">0 ms</strong></div>
+      <div class="metric"><span>停止后到首个 delta</span><strong id="replyMs">0 ms</strong></div>
       <div class="metric"><span>已发送音频</span><strong id="sentBytes">0 B</strong></div>
     </div>
 
@@ -222,6 +222,11 @@
       <h2>模型回复</h2>
       <pre id="reply"></pre>
     </section>
+
+    <section class="panel">
+      <h2>流式片段</h2>
+      <pre id="deltas"></pre>
+    </section>
   </main>
 
   <script>
@@ -232,6 +237,7 @@
     const statusEl = document.querySelector("#status");
     const transcriptEl = document.querySelector("#transcript");
     const replyEl = document.querySelector("#reply");
+    const deltasEl = document.querySelector("#deltas");
     const recordMsEl = document.querySelector("#recordMs");
     const replyMsEl = document.querySelector("#replyMs");
     const sentBytesEl = document.querySelector("#sentBytes");
@@ -286,20 +292,48 @@
 
     async function stopAndReply() {
       const stoppedAt = performance.now();
-      setStatus("正在结束 ASR 并等待模型回复...");
+      let firstDeltaReceived = false;
+      const deltas = [];
+      setStatus("正在结束 ASR 并等待模型流式回复...");
       stopAudioGraph();
       stopButton.disabled = true;
       abortButton.disabled = true;
       await flushChunks();
-      const response = await postJson("/tools/voice-latency/finish", {
-        session_id: sessionId,
-        conversation_id: conversationIdInput.value.trim() || "voice-latency-demo",
-        tts_enabled: false,
+      await postEventStream("/tools/voice-latency/finish-stream", {
+          session_id: sessionId,
+          conversation_id: conversationIdInput.value.trim() || "voice-latency-demo",
+          tts_enabled: false,
+        },
+        (event) => {
+          if (event.event === "transcript") {
+            transcriptEl.textContent = event.data.transcript || transcriptEl.textContent;
+            return;
+          }
+          if (event.event === "delta") {
+            if (!firstDeltaReceived) {
+              firstDeltaReceived = true;
+              replyMsEl.textContent = `${Math.round(performance.now() - stoppedAt)} ms`;
+              setStatus("正在接收模型回复...");
+            }
+            const delta = event.data.delta || "";
+            deltas.push(delta);
+            replyEl.textContent += delta;
+            deltasEl.textContent = JSON.stringify(deltas, null, 2);
+            return;
+          }
+          if (event.event === "done") {
+            transcriptEl.textContent = event.data.transcript || transcriptEl.textContent;
+            replyEl.textContent = event.data.reply || replyEl.textContent;
+            setStatus("完成");
+            return;
+          }
+          if (event.event === "error") {
+            throw new Error(event.data.message || "stream error");
+          }
       });
-      replyMsEl.textContent = `${Math.round(performance.now() - stoppedAt)} ms`;
-      transcriptEl.textContent = response.transcript || transcriptEl.textContent;
-      replyEl.textContent = response.reply || "";
-      setStatus("完成");
+      if (!firstDeltaReceived) {
+        replyMsEl.textContent = "无 delta";
+      }
       resetSession();
     }
 
@@ -395,6 +429,48 @@
       return data;
     }
 
+    async function postEventStream(url, body, onEvent) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok || !response.body) {
+        const text = await response.text();
+        throw new Error(text || `HTTP ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() || "";
+        for (const frame of frames) {
+          const event = parseSseFrame(frame);
+          if (event) onEvent(event);
+        }
+      }
+      buffer += decoder.decode();
+      const tail = parseSseFrame(buffer);
+      if (tail) onEvent(tail);
+    }
+
+    function parseSseFrame(frame) {
+      const lines = frame.split("\n");
+      let event = "message";
+      const dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      }
+      if (dataLines.length === 0) return null;
+      return { event, data: JSON.parse(dataLines.join("\n")) };
+    }
+
     function bytesToBase64(bytes) {
       let binary = "";
       for (let i = 0; i < bytes.length; i += 1) {
@@ -433,6 +509,7 @@
     function clearOutput() {
       transcriptEl.textContent = "";
       replyEl.textContent = "";
+      deltasEl.textContent = "";
       recordMsEl.textContent = "0 ms";
       replyMsEl.textContent = "0 ms";
       sentBytesEl.textContent = "0 B";

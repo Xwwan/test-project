@@ -19,6 +19,7 @@
 | `GET`  | `/voice/live/transcript` | 查询实时语音识别会话的最新字幕 |
 | `POST` | `/voice/live/finish` | 结束实时语音识别会话，并用最终文本生成回复和可选语音 |
 | `POST` | `/voice/live/abort` | 中止实时语音识别会话，不生成回复 |
+| `POST` | `/tools/voice-latency/finish-stream` | 结束实时语音识别会话，并以 SSE 流式返回延迟测试回复 |
 | `GET`  | `/followups/pending` | 列出等待 followup 决策的请求 |
 | `POST` | `/followups/{request_id}/run` | 触发某个请求的二次回复判断 |
 | `POST` | `/memory/curate` | 对一段对话运行 Memory Curator 并落库 |
@@ -294,6 +295,40 @@ data: {"message":"human readable reason"}
 
 - 用于取消录音或页面关闭。
 - 只关闭 ASR 会话，不调用 chat、memory retrieval 或 TTS。
+
+### 5.6 `POST /tools/voice-latency/finish-stream`
+
+该接口只供本地语音延迟测试页面使用。请求与 `/voice/live/finish` 相同：
+
+```json
+{
+  "session_id": "live_<uuid4_hex>",
+  "conversation_id": "voice-latency-demo",
+  "tts_enabled": false
+}
+```
+
+响应为 `text/event-stream; charset=utf-8`，事件顺序：
+
+```text
+event: transcript
+data: {"session_id":"live_<uuid4_hex>","conversation_id":"voice-latency-demo","transcript":"最终识别文本"}
+
+event: meta
+data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"voice-latency-demo"}
+
+event: delta
+data: {"delta":"回复片段"}
+
+event: done
+data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"voice-latency-demo","reply":"完整回复","retrieval_status":"completed","retrieved_memory_ids":[],"transcript":"最终识别文本","audio_base64":null,"audio_format":"pcm"}
+```
+
+约定：
+
+- 页面用第一个 `delta` 到达时间统计模型首响应延迟，并继续读取流直到 `done`。
+- 该接口使用 no-op conversation/history/memory 依赖，不写入本地 SQLite 数据库。
+- 当前延迟测试页面传入 `tts_enabled=false`，不生成 TTS 音频。
 
 ---
 

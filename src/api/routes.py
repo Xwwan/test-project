@@ -271,6 +271,46 @@ def _post_voice_latency_finish(
     return 200, response.to_dict()
 
 
+def iter_voice_latency_finish_stream(
+    request: LiveVoiceFinishRequest,
+    *,
+    audio_dependencies: AudioDependencies | None = None,
+    live_asr_manager: LiveAsrSessionManager | None = None,
+):
+    """Finish live ASR and stream the model reply for the voice latency page."""
+
+    manager = live_asr_manager or get_default_live_asr_manager()
+    state = manager.finish_session(request.session_id)
+    if state.error:
+        raise ValueError(state.error)
+    transcript = state.transcript.strip()
+    if not transcript:
+        raise ValueError("speech recognition produced an empty transcript")
+
+    yield {
+        "event": "transcript",
+        "data": {
+            "session_id": request.session_id,
+            "conversation_id": request.conversation_id,
+            "transcript": transcript,
+        },
+    }
+
+    for item in handle_chat_message_stream(
+        request.conversation_id,
+        transcript,
+        dependencies=_build_no_db_latency_dependencies(),
+    ):
+        if item.get("event") == "done":
+            data = dict(item.get("data", {}))
+            data["transcript"] = transcript
+            data["audio_base64"] = None
+            data["audio_format"] = "pcm"
+            yield {"event": "done", "data": data}
+            continue
+        yield item
+
+
 def _post_voice_live_abort(
     body: Any,
     live_asr_manager: LiveAsrSessionManager | None,
@@ -364,7 +404,7 @@ def _handle_latency_chat_message(
 def _build_no_db_latency_dependencies() -> DialogueDependencies:
     """Build dependencies for latency probes that must not write to SQLite."""
 
-    from src.agents.dialogue_agent import generate_initial_reply
+    from src.agents.dialogue_agent import generate_initial_reply, generate_initial_reply_stream
 
     return DialogueDependencies(
         read_model_profile=lambda: "",
@@ -378,6 +418,7 @@ def _build_no_db_latency_dependencies() -> DialogueDependencies:
         get_memory_items_by_ids=lambda ids: [],
         apply_memory_operations=lambda operations: [],
         generate_initial_reply=generate_initial_reply,
+        generate_initial_reply_stream=generate_initial_reply_stream,
         generate_followup_reply=lambda input_data, **kwargs: {
             "request_id": input_data["request_id"],
             "decision": "no_followup",
@@ -449,6 +490,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             if urlsplit(self.path).path == "/chat/stream":
                 self._write_chat_stream(body)
                 return
+            if urlsplit(self.path).path == "/tools/voice-latency/finish-stream":
+                self._write_voice_latency_stream(body)
+                return
 
         status, response_body = dispatch(
             method,
@@ -482,6 +526,32 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 event = item.get("event", "message")
                 data = item.get("data", {})
                 self._write_sse_event(event, data)
+        except Exception as exc:  # pragma: no cover - defensive network path
+            self._write_sse_event(
+                "error",
+                {"message": str(exc) or exc.__class__.__name__},
+            )
+
+    def _write_voice_latency_stream(self, body: Any) -> None:
+        try:
+            request = LiveVoiceFinishRequest.from_dict(body or {})
+        except SchemaError as exc:
+            self._write_json(400, {"error": {"message": str(exc)}})
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        try:
+            for item in iter_voice_latency_finish_stream(
+                request,
+                audio_dependencies=type(self).injected_audio_dependencies,
+                live_asr_manager=type(self).injected_live_asr_manager,
+            ):
+                self._write_sse_event(item.get("event", "message"), item.get("data", {}))
         except Exception as exc:  # pragma: no cover - defensive network path
             self._write_sse_event(
                 "error",

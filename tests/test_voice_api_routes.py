@@ -6,10 +6,11 @@ import base64
 import unittest
 from unittest.mock import patch
 
-from src.api.routes import dispatch
+from src.api.routes import dispatch, iter_voice_latency_finish_stream
 from src.coordinator import request_coordinator
 from src.audio.live_asr import LiveAsrSessionNotFoundError, LiveTranscriptState
 from src.audio.service import AudioDependencies
+from src.audio.schemas import LiveVoiceFinishRequest
 
 
 class VoiceApiRoutesTest(unittest.TestCase):
@@ -254,6 +255,48 @@ class VoiceApiRoutesTest(unittest.TestCase):
         assert body["audio_base64"] is None
         assert body["retrieved_memory_ids"] == []
         assert injected_chat_calls == []
+        assert manager.finished == ["live-1"]
+
+    def test_voice_latency_finish_stream_yields_transcript_deltas_and_done(self) -> None:
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="只测试流式延迟",
+            is_final=True,
+            error=None,
+        )
+
+        def fake_initial_stream(input_data, **kwargs):
+            yield "流式"
+            yield "回复"
+
+        with patch(
+            "src.agents.dialogue_agent.generate_initial_reply_stream",
+            fake_initial_stream,
+        ):
+            events = list(
+                iter_voice_latency_finish_stream(
+                    LiveVoiceFinishRequest(
+                        session_id="live-1",
+                        conversation_id="conv-latency",
+                        tts_enabled=False,
+                    ),
+                    live_asr_manager=manager,
+                )
+            )
+
+        assert [event["event"] for event in events] == [
+            "transcript",
+            "meta",
+            "delta",
+            "delta",
+            "done",
+        ]
+        assert events[0]["data"]["transcript"] == "只测试流式延迟"
+        assert events[2]["data"] == {"delta": "流式"}
+        assert events[3]["data"] == {"delta": "回复"}
+        assert events[-1]["data"]["transcript"] == "只测试流式延迟"
+        assert events[-1]["data"]["reply"] == "流式回复"
+        assert events[-1]["data"]["audio_base64"] is None
         assert manager.finished == ["live-1"]
 
     def test_live_voice_abort_does_not_call_chat(self) -> None:
