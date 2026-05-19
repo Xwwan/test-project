@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.agents._prompting import (
+    dump_prompt_debug,
     dumps_pretty,
     normalize_history,
     parse_json_object,
@@ -65,6 +66,12 @@ def generate_initial_reply(
         ChatMessage(role="system", content=prompt),
         ChatMessage(role="user", content=_build_initial_context(input_data)),
     ]
+    dump_prompt_debug(
+        "dialogue.initial",
+        request_id=request_id,
+        recent_history=input_data.get("recent_history", []),
+        messages=messages,
+    )
     response = chat_once(
         messages,
         client=model_client,
@@ -92,6 +99,12 @@ def generate_initial_reply_stream(
         ChatMessage(role="system", content=prompt),
         ChatMessage(role="user", content=_build_initial_context(input_data)),
     ]
+    dump_prompt_debug(
+        "dialogue.initial.stream",
+        request_id=_required_string(input_data, "request_id"),
+        recent_history=input_data.get("recent_history", []),
+        messages=messages,
+    )
     yield from chat_stream(
         messages,
         client=model_client,
@@ -121,6 +134,12 @@ def generate_followup_reply(
         ChatMessage(role="system", content=prompt),
         ChatMessage(role="user", content=_build_followup_context(input_data)),
     ]
+    dump_prompt_debug(
+        "dialogue.followup",
+        request_id=request_id,
+        recent_history=input_data.get("recent_history", []),
+        messages=messages,
+    )
     response = chat_once(
         messages,
         client=model_client,

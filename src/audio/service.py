@@ -14,6 +14,7 @@ from src.audio.schemas import VoiceChatResponse
 from src.audio.stt import SpeechToTextClient, build_default_stt_client
 from src.audio.tts import TextToSpeechClient, build_default_tts_client
 from src.services import DialogueDependencies, handle_chat_message
+from src.services.reply_tags import prepare_tts_text
 
 
 ChatHandler = Callable[..., dict]
@@ -88,8 +89,10 @@ def handle_voice_reply_from_text(
 
     output_audio = None
     if tts_enabled:
-        tts_client = deps.tts_client or build_default_tts_client()
-        output_audio = tts_client.synthesize(reply)
+        tts_text = prepare_tts_text(reply)
+        if tts_text.strip():
+            tts_client = deps.tts_client or build_default_tts_client()
+            output_audio = tts_client.synthesize(tts_text)
     return VoiceChatResponse(
         conversation_id=chat_payload["conversation_id"],
         request_id=chat_payload["request_id"],

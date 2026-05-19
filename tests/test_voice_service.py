@@ -133,6 +133,31 @@ class VoiceServiceTest(unittest.TestCase):
         assert stt.last_audio is None
         assert tts.last_text == "回复:实时字幕"
 
+    def test_handle_voice_reply_from_text_strips_all_reply_tags_before_tts(
+        self,
+    ) -> None:
+        tts = FakeTts()
+
+        result = handle_voice_reply_from_text(
+            "conv-1",
+            "实时字幕",
+            dependencies=AudioDependencies(
+                tts_client=tts,
+                chat_handler=lambda conversation_id, message, *, dependencies=None: {
+                    "conversation_id": conversation_id,
+                    "request_id": "req-1",
+                    "turn_id": "turn-1",
+                    "reply": "回复[emo:angry]，继续[act:开心]。[emo:excited][act:😁]",
+                    "retrieval_status": "completed",
+                    "retrieved_memory_ids": [],
+                },
+            ),
+        )
+
+        assert result.reply == "回复[emo:angry]，继续[act:开心]。[emo:excited][act:😁]"
+        assert result.audio_bytes == b"voice"
+        assert tts.last_text == "回复，继续。"
+
     def test_handle_voice_reply_from_text_skips_tts_when_disabled(self) -> None:
         tts = FakeTts()
 

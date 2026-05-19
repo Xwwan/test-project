@@ -51,6 +51,7 @@ from src.services import (
     handle_followup,
     refresh_user_profile,
 )
+from src.services.reply_tags import prepare_tts_text
 from .schemas import (
     ChatRequest,
     ChatResponse,
@@ -419,10 +420,11 @@ def _build_no_db_latency_dependencies() -> DialogueDependencies:
     """Build dependencies for latency probes that must not write to SQLite."""
 
     from src.agents.dialogue_agent import generate_initial_reply, generate_initial_reply_stream
+    from src.persona.file_manager import read_model_profile, read_user_profile
 
     return DialogueDependencies(
-        read_model_profile=lambda: "",
-        read_user_profile=lambda: "",
+        read_model_profile=read_model_profile,
+        read_user_profile=read_user_profile,
         apply_user_profile_patch=lambda patch: "",
         append_turn=lambda conversation_id, turn: turn["turn_id"],
         get_recent_history=lambda conversation_id, limit=20: [],
@@ -457,7 +459,8 @@ def _iter_tts_audio_events(
     *,
     audio_dependencies: AudioDependencies | None = None,
 ):
-    if not text.strip():
+    tts_text = prepare_tts_text(text)
+    if not tts_text.strip():
         return
 
     from src.audio.tts import build_default_tts_client
@@ -466,9 +469,9 @@ def _iter_tts_audio_events(
     tts_client = audio_deps.tts_client or build_default_tts_client()
     stream_fn = getattr(tts_client, "synthesize_stream", None)
     if callable(stream_fn):
-        chunks = stream_fn(text)
+        chunks = stream_fn(tts_text)
     else:
-        chunks = [tts_client.synthesize(text)]
+        chunks = [tts_client.synthesize(tts_text)]
 
     sample_rate = getattr(tts_client, "sample_rate", 24000)
     for index, chunk in enumerate(chunks):

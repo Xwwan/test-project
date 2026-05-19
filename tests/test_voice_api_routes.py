@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from src.api.routes import dispatch, iter_voice_latency_finish_stream
@@ -11,6 +13,7 @@ from src.coordinator import request_coordinator
 from src.audio.live_asr import LiveAsrSessionNotFoundError, LiveTranscriptState
 from src.audio.service import AudioDependencies
 from src.audio.schemas import LiveVoiceFinishRequest
+from src.persona import file_manager
 
 
 class VoiceApiRoutesTest(unittest.TestCase):
@@ -19,6 +22,7 @@ class VoiceApiRoutesTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         request_coordinator.reset_store()
+        file_manager.reset_data_dir()
 
     def test_post_voice_chat_returns_transcript_reply_and_audio(self) -> None:
         deps = AudioDependencies(
@@ -257,6 +261,46 @@ class VoiceApiRoutesTest(unittest.TestCase):
         assert injected_chat_calls == []
         assert manager.finished == ["live-1"]
 
+    def test_voice_latency_finish_includes_model_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            data_dir.mkdir()
+            (data_dir / "Model.md").write_text("模型人设内容", encoding="utf-8")
+            (data_dir / "User.md").write_text("用户画像内容", encoding="utf-8")
+            file_manager.set_data_dir(data_dir)
+
+            manager = FakeLiveAsrManager()
+            manager.states["live-1"] = LiveTranscriptState(
+                transcript="看看人设",
+                is_final=True,
+                error=None,
+            )
+            seen_input: dict = {}
+
+            def fake_initial(input_data, **kwargs):
+                seen_input.update(input_data)
+                return {
+                    "request_id": input_data["request_id"],
+                    "reply": "收到",
+                }
+
+            with patch("src.agents.dialogue_agent.generate_initial_reply", fake_initial):
+                status, body = dispatch(
+                    "POST",
+                    "/tools/voice-latency/finish",
+                    {
+                        "session_id": "live-1",
+                        "conversation_id": "conv-latency",
+                        "tts_enabled": False,
+                    },
+                    live_asr_manager=manager,
+                )
+
+        assert status == 200
+        assert body["reply"] == "收到"
+        assert seen_input["model_profile"] == "模型人设内容"
+        assert seen_input["user_profile"] == "用户画像内容"
+
     def test_voice_latency_finish_stream_yields_transcript_deltas_and_done(self) -> None:
         manager = FakeLiveAsrManager()
         manager.states["live-1"] = LiveTranscriptState(
@@ -309,8 +353,8 @@ class VoiceApiRoutesTest(unittest.TestCase):
         tts = FakeStreamingTts([b"audio-a", b"audio-b"])
 
         def fake_initial_stream(input_data, **kwargs):
-            yield "语音"
-            yield "回复"
+            yield "语音[emo:angry]"
+            yield "回复[act:开心]"
 
         with patch(
             "src.agents.dialogue_agent.generate_initial_reply_stream",
@@ -347,7 +391,7 @@ class VoiceApiRoutesTest(unittest.TestCase):
         assert events[5]["data"]["audio_base64"] == base64.b64encode(b"audio-b").decode(
             "ascii"
         )
-        assert events[-1]["data"]["reply"] == "语音回复"
+        assert events[-1]["data"]["reply"] == "语音[emo:angry]回复[act:开心]"
         assert events[-1]["data"]["audio_base64"] is None
 
     def test_live_voice_abort_does_not_call_chat(self) -> None:

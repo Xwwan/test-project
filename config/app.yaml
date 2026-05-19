@@ -59,6 +59,16 @@ routes:
       response_format:
         type: json_object
 
+reply_tags:
+  emo:
+    - angry
+    - sad
+    - 😧
+    - 开心
+  act:
+    - sad
+    - 开心
+
 audio:
   stt:
     provider: volcengine
@@ -77,3 +87,6 @@ audio:
     voice: Cherry
     sample_rate: 24000
     timeout_seconds: 60
+
+debug:
+  print_prompts: true

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.agents._prompting import (
+    dump_prompt_debug,
     dumps_pretty,
     normalize_history,
     parse_json_object,
@@ -64,6 +65,12 @@ def retrieve_relevant_memory_ids(
             ),
         ),
     ]
+    dump_prompt_debug(
+        "memory.retrieval",
+        request_id=request_id,
+        recent_history=recent_history,
+        messages=messages,
+    )
 
     response = chat_once(
         messages,
