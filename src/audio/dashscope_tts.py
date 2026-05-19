@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlencode
 
 
@@ -20,8 +20,13 @@ class DashScopeTtsClient:
     def synthesize(self, text: str) -> bytes:
         """Synthesize text to raw PCM bytes."""
 
+        return b"".join(self.synthesize_stream(text))
+
+    def synthesize_stream(self, text: str) -> Iterator[bytes]:
+        """Synthesize text and yield raw PCM chunks as they arrive."""
+
         if not isinstance(text, str) or not text.strip():
-            return b""
+            return
         websocket = _load_websocket_client()
         url = f"{self.realtime_url}?{urlencode({'model': self.model})}"
         socket = websocket.create_connection(
@@ -29,14 +34,12 @@ class DashScopeTtsClient:
             timeout=self.timeout_seconds,
             header=[f"Authorization: Bearer {self.api_key}"],
         )
-        audio_parts: list[bytes] = []
         try:
-            self._run_session(socket, text, audio_parts)
+            yield from self._iter_session_audio(socket, text)
         finally:
             socket.close()
-        return b"".join(audio_parts)
 
-    def _run_session(self, socket: Any, text: str, audio_parts: list[bytes]) -> None:
+    def _iter_session_audio(self, socket: Any, text: str) -> Iterator[bytes]:
         import base64
 
         while True:
@@ -75,7 +78,7 @@ class DashScopeTtsClient:
             if msg_type == "response.audio.delta":
                 delta = message.get("delta")
                 if isinstance(delta, str):
-                    audio_parts.append(base64.b64decode(delta))
+                    yield base64.b64decode(delta)
                 continue
 
             if msg_type == "response.done":

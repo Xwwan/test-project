@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 from src.audio.dashscope_tts import DashScopeTtsClient
 from src.utils.config import load_app_config
@@ -13,6 +13,9 @@ from src.utils.env import get_config_value
 class TextToSpeechClient(Protocol):
     def synthesize(self, text: str) -> bytes:
         """Return synthesized audio bytes for the provided text."""
+
+    def synthesize_stream(self, text: str) -> Iterator[bytes]:
+        """Yield synthesized audio chunks for the provided text."""
 
 
 def build_default_tts_client(

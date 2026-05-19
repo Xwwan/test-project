@@ -79,6 +79,22 @@
       background: #fff;
     }
 
+    .checkbox {
+      display: flex;
+      min-width: auto;
+      height: 40px;
+      align-items: center;
+      grid-template-columns: none;
+      gap: 8px;
+      color: var(--ink);
+    }
+
+    .checkbox input {
+      width: 16px;
+      height: 16px;
+      padding: 0;
+    }
+
     button {
       height: 40px;
       border: 0;
@@ -197,6 +213,10 @@
         conversation_id
         <input id="conversationId" value="voice-latency-demo">
       </label>
+      <label class="checkbox">
+        <input id="ttsEnabled" type="checkbox">
+        播放 TTS
+      </label>
       <button id="startButton">开始录音</button>
       <button id="stopButton" class="secondary" disabled>停止并生成回复</button>
       <button id="abortButton" class="secondary" disabled>取消</button>
@@ -234,6 +254,7 @@
     const stopButton = document.querySelector("#stopButton");
     const abortButton = document.querySelector("#abortButton");
     const conversationIdInput = document.querySelector("#conversationId");
+    const ttsEnabledInput = document.querySelector("#ttsEnabled");
     const statusEl = document.querySelector("#status");
     const transcriptEl = document.querySelector("#transcript");
     const replyEl = document.querySelector("#reply");
@@ -245,6 +266,8 @@
     const targetSampleRate = 16000;
     const chunkBytes = 5120;
     let audioContext = null;
+    let playbackContext = null;
+    let playbackCursorTime = 0;
     let sourceNode = null;
     let processorNode = null;
     let stream = null;
@@ -294,6 +317,7 @@
       const stoppedAt = performance.now();
       let firstDeltaReceived = false;
       const deltas = [];
+      if (ttsEnabledInput.checked) ensurePlaybackContext();
       setStatus("正在结束 ASR 并等待模型流式回复...");
       stopAudioGraph();
       stopButton.disabled = true;
@@ -302,7 +326,7 @@
       await postEventStream("/tools/voice-latency/finish-stream", {
           session_id: sessionId,
           conversation_id: conversationIdInput.value.trim() || "voice-latency-demo",
-          tts_enabled: false,
+          tts_enabled: ttsEnabledInput.checked,
         },
         (event) => {
           if (event.event === "transcript") {
@@ -319,6 +343,14 @@
             deltas.push(delta);
             replyEl.textContent += delta;
             deltasEl.textContent = JSON.stringify(deltas, null, 2);
+            return;
+          }
+          if (event.event === "audio") {
+            playPcmChunk(
+              base64ToBytes(event.data.audio_base64 || ""),
+              event.data.sample_rate || 24000,
+            );
+            setStatus("正在播放 TTS...");
             return;
           }
           if (event.event === "done") {
@@ -408,6 +440,32 @@
       return output;
     }
 
+    function ensurePlaybackContext() {
+      if (!playbackContext) {
+        playbackContext = new AudioContext();
+        playbackCursorTime = playbackContext.currentTime + 0.05;
+      }
+      if (playbackContext.state === "suspended") playbackContext.resume();
+    }
+
+    function playPcmChunk(bytes, sampleRate) {
+      if (!bytes.length) return;
+      ensurePlaybackContext();
+      const samples = Math.floor(bytes.length / 2);
+      const buffer = playbackContext.createBuffer(1, samples, sampleRate);
+      const channel = buffer.getChannelData(0);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      for (let i = 0; i < samples; i += 1) {
+        channel[i] = view.getInt16(i * 2, true) / 0x8000;
+      }
+      const source = playbackContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(playbackContext.destination);
+      const startAt = Math.max(playbackCursorTime, playbackContext.currentTime + 0.02);
+      source.start(startAt);
+      playbackCursorTime = startAt + buffer.duration;
+    }
+
     async function pollTranscript() {
       if (!sessionId) return;
       const response = await fetch(`/voice/live/transcript?session_id=${encodeURIComponent(sessionId)}`);
@@ -479,6 +537,16 @@
       return btoa(binary);
     }
 
+    function base64ToBytes(value) {
+      if (!value) return new Uint8Array();
+      const binary = atob(value);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
     function stopAudioGraph() {
       clearInterval(recordTimer);
       clearInterval(transcriptTimer);
@@ -514,6 +582,13 @@
       replyMsEl.textContent = "0 ms";
       sentBytesEl.textContent = "0 B";
       statusEl.classList.remove("error");
+      resetPlayback();
+    }
+
+    function resetPlayback() {
+      if (playbackContext) playbackContext.close();
+      playbackContext = null;
+      playbackCursorTime = 0;
     }
 
     function setStatus(message) {

@@ -15,6 +15,7 @@ Person 1 / Person 2 implementations while tests stay hermetic.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -296,6 +297,7 @@ def iter_voice_latency_finish_stream(
         },
     }
 
+    done_event: dict | None = None
     for item in handle_chat_message_stream(
         request.conversation_id,
         transcript,
@@ -306,9 +308,21 @@ def iter_voice_latency_finish_stream(
             data["transcript"] = transcript
             data["audio_base64"] = None
             data["audio_format"] = "pcm"
-            yield {"event": "done", "data": data}
+            done_event = {"event": "done", "data": data}
             continue
         yield item
+
+    if done_event is None:
+        return
+
+    if request.tts_enabled:
+        reply = done_event["data"].get("reply") or ""
+        yield from _iter_tts_audio_events(
+            reply,
+            audio_dependencies=audio_dependencies,
+        )
+
+    yield done_event
 
 
 def _post_voice_live_abort(
@@ -436,6 +450,39 @@ def _build_no_db_latency_dependencies() -> DialogueDependencies:
             "reason": "latency probe",
         },
     )
+
+
+def _iter_tts_audio_events(
+    text: str,
+    *,
+    audio_dependencies: AudioDependencies | None = None,
+):
+    if not text.strip():
+        return
+
+    from src.audio.tts import build_default_tts_client
+
+    audio_deps = audio_dependencies or AudioDependencies()
+    tts_client = audio_deps.tts_client or build_default_tts_client()
+    stream_fn = getattr(tts_client, "synthesize_stream", None)
+    if callable(stream_fn):
+        chunks = stream_fn(text)
+    else:
+        chunks = [tts_client.synthesize(text)]
+
+    sample_rate = getattr(tts_client, "sample_rate", 24000)
+    for index, chunk in enumerate(chunks):
+        if not chunk:
+            continue
+        yield {
+            "event": "audio",
+            "data": {
+                "audio_base64": base64.b64encode(chunk).decode("ascii"),
+                "audio_format": "pcm",
+                "sample_rate": sample_rate,
+                "chunk_index": index,
+            },
+        }
 
 
 # ---------------------------------------------------------------------------

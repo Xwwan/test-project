@@ -306,7 +306,7 @@ data: {"message":"human readable reason"}
 {
   "session_id": "live_<uuid4_hex>",
   "conversation_id": "voice-latency-demo",
-  "tts_enabled": false
+  "tts_enabled": true
 }
 ```
 
@@ -322,6 +322,9 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 event: delta
 data: {"delta":"回复片段"}
 
+event: audio
+data: {"audio_base64":"base64 encoded 24kHz 16-bit mono PCM chunk","audio_format":"pcm","sample_rate":24000,"chunk_index":0}
+
 event: done
 data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"voice-latency-demo","reply":"完整回复","retrieval_status":"pending","retrieved_memory_ids":[],"transcript":"最终识别文本","audio_base64":null,"audio_format":"pcm"}
 ```
@@ -330,7 +333,9 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 
 - 页面用第一个 `delta` 到达时间统计模型首响应延迟，并继续读取流直到 `done`。
 - 该接口使用 no-op conversation/history/memory 依赖，不写入本地 SQLite 数据库。
-- 当前延迟测试页面传入 `tts_enabled=false`，不生成 TTS 音频。
+- 当 `tts_enabled=true` 时，服务端会在完整回复生成后以一个或多个 `audio`
+  事件流式返回 TTS PCM chunk；`done.audio_base64` 仍为 `null`，避免重复返回完整音频。
+- 当 `tts_enabled=false` 时，不发送 `audio` 事件。
 
 ---
 

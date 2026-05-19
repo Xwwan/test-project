@@ -299,6 +299,57 @@ class VoiceApiRoutesTest(unittest.TestCase):
         assert events[-1]["data"]["audio_base64"] is None
         assert manager.finished == ["live-1"]
 
+    def test_voice_latency_finish_stream_yields_tts_audio_events_when_enabled(self) -> None:
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="需要语音",
+            is_final=True,
+            error=None,
+        )
+        tts = FakeStreamingTts([b"audio-a", b"audio-b"])
+
+        def fake_initial_stream(input_data, **kwargs):
+            yield "语音"
+            yield "回复"
+
+        with patch(
+            "src.agents.dialogue_agent.generate_initial_reply_stream",
+            fake_initial_stream,
+        ):
+            events = list(
+                iter_voice_latency_finish_stream(
+                    LiveVoiceFinishRequest(
+                        session_id="live-1",
+                        conversation_id="conv-latency",
+                        tts_enabled=True,
+                    ),
+                    audio_dependencies=AudioDependencies(tts_client=tts),
+                    live_asr_manager=manager,
+                )
+            )
+
+        assert [event["event"] for event in events] == [
+            "transcript",
+            "meta",
+            "delta",
+            "delta",
+            "audio",
+            "audio",
+            "done",
+        ]
+        assert tts.streamed_text == "语音回复"
+        assert events[4]["data"]["audio_base64"] == base64.b64encode(b"audio-a").decode(
+            "ascii"
+        )
+        assert events[4]["data"]["audio_format"] == "pcm"
+        assert events[4]["data"]["sample_rate"] == 24000
+        assert events[4]["data"]["chunk_index"] == 0
+        assert events[5]["data"]["audio_base64"] == base64.b64encode(b"audio-b").decode(
+            "ascii"
+        )
+        assert events[-1]["data"]["reply"] == "语音回复"
+        assert events[-1]["data"]["audio_base64"] is None
+
     def test_live_voice_abort_does_not_call_chat(self) -> None:
         manager = FakeLiveAsrManager()
 
@@ -364,6 +415,21 @@ class FakeLiveAsrManager:
     def _require(self, session_id: str) -> None:
         if session_id not in self.states:
             raise LiveAsrSessionNotFoundError(f"unknown live ASR session: {session_id}")
+
+
+class FakeStreamingTts:
+    sample_rate = 24000
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = list(chunks)
+        self.streamed_text: str | None = None
+
+    def synthesize(self, text: str) -> bytes:
+        return b"".join(self.synthesize_stream(text))
+
+    def synthesize_stream(self, text: str):
+        self.streamed_text = text
+        yield from self.chunks
 
 
 if __name__ == "__main__":
