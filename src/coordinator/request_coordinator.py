@@ -37,14 +37,23 @@ REQUEST_STATUSES: tuple[str, ...] = (
     "initial_reply_generated",
     "retrieval_pending",
     "retrieval_completed",
+    "retrieval_failed",
     "followup_generated",
     "no_followup_needed",
+    "followup_failed",
     "completed",
     "failed",
 )
 
 TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"completed", "failed", "followup_generated", "no_followup_needed"}
+    {
+        "completed",
+        "failed",
+        "retrieval_failed",
+        "followup_generated",
+        "no_followup_needed",
+        "followup_failed",
+    }
 )
 
 
@@ -93,25 +102,50 @@ def create_request(conversation_id: str, user_message: str) -> dict:
             {"status": "received", "at": created_at},
         ],
         "initial_reply": None,
+        "initial_reply_turn_id": None,
+        "context_snapshot": None,
         "retrieved_items": [],
         "followup_decision": None,
         "error": None,
+        "retrieval_status": None,
+        "retrieval_error": None,
+        "followup_status": None,
+        "followup_error": None,
+        "delivery_status": "none",
     }
     with _store_lock:
         _requests[request_id] = record
     return _public_view(record)
 
 
-def mark_initial_reply(request_id: str, reply: str) -> None:
+def mark_initial_reply(
+    request_id: str,
+    reply: str,
+    *,
+    assistant_turn_id: str | None = None,
+) -> None:
     """Record that the immediate reply has been produced."""
 
     if not isinstance(reply, str):
         raise ValueError("reply must be a string")
+    if assistant_turn_id is not None and not isinstance(assistant_turn_id, str):
+        raise ValueError("assistant_turn_id must be a string")
     with _store_lock:
         record = _require_request(request_id)
         _ensure_can_advance_from(record, allowed={"received"})
         record["initial_reply"] = reply
+        record["initial_reply_turn_id"] = assistant_turn_id
         _set_status(record, "initial_reply_generated")
+
+
+def attach_context_snapshot(request_id: str, snapshot: dict) -> None:
+    """Attach the immutable request-time dialogue context snapshot."""
+
+    if not isinstance(snapshot, dict):
+        raise ValueError("snapshot must be a dictionary")
+    with _store_lock:
+        record = _require_request(request_id)
+        record["context_snapshot"] = deepcopy(snapshot)
 
 
 def mark_retrieval_pending(request_id: str) -> None:
@@ -123,6 +157,8 @@ def mark_retrieval_pending(request_id: str) -> None:
             record,
             allowed={"initial_reply_generated"},
         )
+        record["retrieval_status"] = "pending"
+        record["retrieval_error"] = None
         _set_status(record, "retrieval_pending")
 
 
@@ -148,8 +184,41 @@ def mark_retrieval_completed(
             },
         )
         record["retrieved_items"] = deepcopy(retrieved_items)
+        record["retrieval_status"] = "completed"
+        record["retrieval_error"] = None
+        record["followup_status"] = "pending"
         _set_status(record, "retrieval_completed")
         _pending_followup_queue.enqueue(request_id)
+
+
+def mark_retrieval_failed(request_id: str, reason: str) -> None:
+    """Record a retrieval failure without failing the already-produced reply."""
+
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("reason must be a non-empty string")
+
+    with _store_lock:
+        record = _require_request(request_id)
+        if record["status"] not in {
+            "initial_reply_generated",
+            "retrieval_pending",
+            "retrieval_failed",
+        }:
+            raise RequestStateError(
+                f"cannot mark retrieval failed for request {record['request_id']} "
+                f"from status {record['status']!r}"
+            )
+        if record["status"] in TERMINAL_STATUSES and record["status"] != "retrieval_failed":
+            raise RequestStateError(
+                f"request {record['request_id']} is already in terminal status "
+                f"{record['status']!r}"
+            )
+        record["retrieval_status"] = "failed"
+        record["retrieval_error"] = reason
+        record["followup_status"] = "failed"
+        record["followup_error"] = reason
+        _pending_followup_queue.remove(request_id)
+        _set_status(record, "retrieval_failed", allow_terminal=True)
 
 
 def get_pending_followup_requests() -> list[dict]:
@@ -174,11 +243,42 @@ def mark_followup_decision(request_id: str, decision: dict) -> None:
         record = _require_request(request_id)
         _ensure_can_advance_from(record, allowed={"retrieval_completed"})
         record["followup_decision"] = deepcopy(decision)
+        record["followup_status"] = (
+            "generated" if decision_name == "followup" else "no_followup"
+        )
+        record["followup_error"] = None
+        record["delivery_status"] = "pending" if decision_name == "followup" else "none"
         _pending_followup_queue.remove(request_id)
         if decision_name == "followup":
             _set_status(record, "followup_generated")
         else:
             _set_status(record, "no_followup_needed")
+
+
+def mark_followup_failed(request_id: str, reason: str) -> None:
+    """Record a follow-up generation failure without failing initial reply."""
+
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("reason must be a non-empty string")
+
+    with _store_lock:
+        record = _require_request(request_id)
+        _ensure_can_advance_from(record, allowed={"retrieval_completed"})
+        record["followup_status"] = "failed"
+        record["followup_error"] = reason
+        _pending_followup_queue.remove(request_id)
+        _set_status(record, "followup_failed")
+
+
+def mark_followup_delivered(request_id: str) -> None:
+    """Mark a generated follow-up event as delivered to a conversation stream."""
+
+    with _store_lock:
+        record = _require_request(request_id)
+        if record.get("delivery_status") != "pending":
+            return
+        record["delivery_status"] = "delivered"
+        record["updated_at"] = _utc_now_iso()
 
 
 def mark_failed(request_id: str, reason: str) -> None:

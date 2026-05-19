@@ -129,7 +129,7 @@ def generate_followup_reply(
     if not isinstance(retrieved_items, list):
         raise ValueError("retrieved_items must be a list")
 
-    prompt = read_prompt("dialogue_agent.md", DEFAULT_DIALOGUE_PROMPT)
+    prompt = DEFAULT_DIALOGUE_PROMPT
     messages = [
         ChatMessage(role="system", content=prompt),
         ChatMessage(role="user", content=_build_followup_context(input_data)),
@@ -171,43 +171,118 @@ def _build_initial_context(input_data: dict) -> str:
 
 
 def _build_followup_context(input_data: dict) -> str:
-    output_schema = {
-        "decision": "followup",
-        "followup_type": "supplement",
-        "reply": "short user-facing follow-up text",
-    }
-    rules = [
-        "Return no_followup when retrieved items are empty or weakly related.",
-        "Return correction when memory would change or correct the initial reply.",
-        "Return supplement when memory adds useful context without correcting the answer.",
-        "For 高风险 domains including 健康、用药、法律、财务, be conservative: "
-        "do not treat old memory as current fact, state uncertainty, and do not "
-        "replace professional advice.",
-        "If the user has moved to another topic, return no_followup.",
-    ]
-    return "\n\n".join(
-        [
-            section("Initial Reply", input_data.get("initial_reply", "")),
-            section(
-                "Current Conversation State",
-                input_data.get("current_conversation_state", ""),
-            ),
-            section("Original User Query", input_data.get("original_user_query", "")),
-            section("Model.md", input_data.get("model_profile", "")),
-            section("User.md", input_data.get("user_profile", "")),
-            section("Compact Memory", input_data.get("compact_history", "")),
-            section("Recent History", normalize_history(input_data.get("recent_history", []))),
-            section("Retrieved Events", input_data.get("retrieved_items", [])),
-            section("Follow-up Decision Rules", rules),
-            section(
-                "Output JSON Requirements",
-                "Return JSON only. decision must be followup or no_followup. "
-                "followup_type must be supplement, correction, or none. "
-                "Use this shape:\n"
-                f"{dumps_pretty(output_schema)}",
-            ),
-        ]
+    template = read_prompt(
+        "dialogue_followup_decision.md",
+        _DEFAULT_FOLLOWUP_DECISION_TEMPLATE,
     )
+    original_context = input_data.get("original_context")
+    if not isinstance(original_context, dict):
+        original_context = {}
+    latest_context = input_data.get("latest_context")
+    if not isinstance(latest_context, dict):
+        latest_context = {}
+
+    replacements = {
+        "request_id": input_data.get("request_id", ""),
+        "conversation_id": input_data.get("conversation_id", ""),
+        "parent_user_turn_id": input_data.get("parent_user_turn_id", ""),
+        "parent_initial_reply_turn_id": input_data.get(
+            "parent_initial_reply_turn_id",
+            "",
+        ),
+        "current_conversation_state": input_data.get("current_conversation_state", ""),
+        "original_user_query": input_data.get("original_user_query", ""),
+        "initial_reply": input_data.get("initial_reply", ""),
+        "original_model_profile": original_context.get(
+            "model_profile",
+            input_data.get("model_profile", ""),
+        ),
+        "original_user_profile": original_context.get(
+            "user_profile",
+            input_data.get("user_profile", ""),
+        ),
+        "original_compact_history": original_context.get(
+            "compact_history",
+            input_data.get("compact_history", ""),
+        ),
+        "original_recent_history": normalize_history(
+            original_context.get("recent_history", input_data.get("recent_history", []))
+        ),
+        "retrieved_items": input_data.get("retrieved_items", []),
+        "latest_recent_history": normalize_history(
+            latest_context.get(
+                "recent_history",
+                input_data.get("latest_recent_history", []),
+            )
+        ),
+        "newer_turns_since_original_request": normalize_history(
+            latest_context.get(
+                "newer_turns_since_original_request",
+                input_data.get("newer_turns_since_original_request", []),
+            )
+        ),
+    }
+
+    rendered = template
+    for key, value in replacements.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", _prompt_value(value))
+    return rendered
+
+
+_DEFAULT_FOLLOWUP_DECISION_TEMPLATE = """# Dialogue Follow-up Decision Prompt
+
+你需要判断一次已经完成的 initial reply 是否需要基于异步检索到的记忆，向用户发送一条二次回复。
+
+Original Request Context 是二次回复要服务的原始问题上下文。
+Retrieved Events 只能用于判断是否应补充或纠正该原始问题的 initial reply。
+Latest Conversation Context 只能用于判断二次回复的措辞、时机和是否需要明确指回原始问题。
+不要用 Latest Conversation Context 改写、扩展或重新解释 Original User Query。
+采用积极二次回复策略：如果 Retrieved Events 对原始问题有明确价值，即使用户已经切换到新话题，也可以发送简短二次回复。
+健康、用药、法律、财务等高风险场景必须保守。
+
+request_id: {{request_id}}
+conversation_id: {{conversation_id}}
+parent_user_turn_id: {{parent_user_turn_id}}
+parent_initial_reply_turn_id: {{parent_initial_reply_turn_id}}
+current_conversation_state: {{current_conversation_state}}
+
+## Original Request Context
+### Original User Query
+{{original_user_query}}
+
+### Initial Reply
+{{initial_reply}}
+
+### Original Model.md
+{{original_model_profile}}
+
+### Original User.md
+{{original_user_profile}}
+
+### Original Compact Memory
+{{original_compact_history}}
+
+### Original Recent History
+{{original_recent_history}}
+
+## Retrieved Events
+{{retrieved_items}}
+
+## Latest Conversation Context
+### Latest Recent History
+{{latest_recent_history}}
+
+### Newer Turns Since Original Request
+{{newer_turns_since_original_request}}
+
+只返回 JSON object，字段为 decision、followup_type、reply。
+"""
+
+
+def _prompt_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return dumps_pretty(value)
 
 
 def _normalize_followup_payload(payload: dict) -> dict:

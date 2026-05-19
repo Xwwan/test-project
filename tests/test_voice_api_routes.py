@@ -18,16 +18,18 @@ from src.coordinator import request_coordinator
 from src.audio.live_asr import LiveAsrSessionNotFoundError, LiveTranscriptState
 from src.audio.service import AudioDependencies
 from src.audio.schemas import LiveVoiceFinishRequest
-from src.services import DialogueDependencies
+from src.services import DialogueDependencies, iter_followup_events, reset_followup_delivery_bus
 from src.persona import file_manager
 
 
 class VoiceApiRoutesTest(unittest.TestCase):
     def setUp(self) -> None:
         request_coordinator.reset_store()
+        reset_followup_delivery_bus()
 
     def tearDown(self) -> None:
         request_coordinator.reset_store()
+        reset_followup_delivery_bus()
         file_manager.reset_data_dir()
 
     def test_post_voice_chat_returns_transcript_reply_and_audio(self) -> None:
@@ -485,7 +487,6 @@ class VoiceApiRoutesTest(unittest.TestCase):
             "delta",
             "audio",
             "done",
-            "followup_done",
         ]
         assert events[0]["data"]["transcript"] == "正式语音"
         assert events[2]["data"] == {"delta": "正式"}
@@ -494,7 +495,7 @@ class VoiceApiRoutesTest(unittest.TestCase):
             "ascii"
         )
         assert tts.streamed_text == "正式回复"
-        done = events[-2]["data"]
+        done = events[-1]["data"]
         assert done["conversation_id"] == "conv-live"
         assert done["reply"] == "正式回复"
         assert done["transcript"] == "正式语音"
@@ -504,11 +505,10 @@ class VoiceApiRoutesTest(unittest.TestCase):
         assert done["retrieved_memory_ids"] == []
         assert done["request_id"].startswith("req_")
         assert done["turn_id"].startswith("turn_")
-        assert events[-1]["data"]["decision"] == "no_followup"
         assert [turn[1]["role"] for turn in appended_turns] == ["user", "assistant"]
         assert manager.finished == ["live-1"]
 
-    def test_live_voice_finish_stream_emits_followup_reply_as_delta(self) -> None:
+    def test_live_voice_finish_stream_routes_followup_to_conversation_stream(self) -> None:
         manager = FakeLiveAsrManager()
         manager.states["live-1"] = LiveTranscriptState(
             transcript="你认识季羡林吗",
@@ -575,19 +575,19 @@ class VoiceApiRoutesTest(unittest.TestCase):
             "meta",
             "delta",
             "done",
-            "delta",
-            "followup_done",
         ]
         assert events[2]["data"] == {"delta": "我知道。"}
-        assert events[4]["data"] == {
-            "delta": "顺便补充：你之前提过也喜欢季羡林。",
-            "phase": "followup",
-            "followup_type": "supplement",
-            "request_id": events[-1]["data"]["request_id"],
-            "conversation_id": "conv-live",
-        }
-        assert events[-1]["data"]["decision"] == "followup"
-        assert events[-1]["data"]["reply"] == "顺便补充：你之前提过也喜欢季羡林。"
+        request_id = events[-1]["data"]["request_id"]
+        followup_events = list(
+            iter_followup_events(
+                "conv-live",
+                keepalive_seconds=0.01,
+                stop_after_idle=True,
+            )
+        )
+        assert [event["event"] for event in followup_events] == ["followup"]
+        assert followup_events[0]["data"]["request_id"] == request_id
+        assert followup_events[0]["data"]["reply"] == "顺便补充：你之前提过也喜欢季羡林。"
         assert [
             turn[1]["metadata_json"]["turn_kind"]
             for turn in appended_turns

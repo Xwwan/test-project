@@ -20,10 +20,12 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from dataclasses import dataclass, field, replace
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterator
 
 from src.coordinator import request_coordinator
+from src.utils.config import load_app_config
 
 
 logger = logging.getLogger("chat-service.dialogue")
@@ -35,6 +37,90 @@ logger = logging.getLogger("chat-service.dialogue")
 RETRIEVAL_STATUS_COMPLETED = "completed"
 RETRIEVAL_STATUS_PENDING = "pending"
 RETRIEVAL_STATUS_FAILED = "failed"
+
+DEFAULT_RETRIEVAL_MAX_WORKERS = 4
+DEFAULT_FOLLOWUP_CONTEXT_WINDOW_TURNS = 50
+
+
+@dataclass(frozen=True)
+class DialogueTurnSnapshot:
+    request_id: str
+    turn_id: str
+    conversation_id: str
+    user_message: str
+    model_profile: str
+    user_profile: str
+    compact_history: str
+    recent_history: list[dict]
+    created_at: str
+    initial_reply: str | None = None
+    initial_reply_turn_id: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "request_id": self.request_id,
+            "turn_id": self.turn_id,
+            "conversation_id": self.conversation_id,
+            "user_message": self.user_message,
+            "model_profile": self.model_profile,
+            "user_profile": self.user_profile,
+            "compact_history": self.compact_history,
+            "recent_history": [dict(turn) for turn in self.recent_history],
+            "created_at": self.created_at,
+            "initial_reply": self.initial_reply,
+            "initial_reply_turn_id": self.initial_reply_turn_id,
+        }
+
+
+class FollowupDeliveryBus:
+    """In-process conversation-level queue for generated follow-up events."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._queues: dict[str, queue.Queue[dict]] = {}
+
+    def publish(self, conversation_id: str, payload: dict) -> None:
+        with self._lock:
+            stream_queue = self._queues.setdefault(conversation_id, queue.Queue())
+        stream_queue.put({"event": "followup", "data": dict(payload)})
+
+    def reset(self) -> None:
+        with self._lock:
+            self._queues.clear()
+
+    def listen(
+        self,
+        conversation_id: str,
+        *,
+        keepalive_seconds: float = 15.0,
+        stop_after_idle: bool = False,
+    ) -> Iterator[dict]:
+        with self._lock:
+            stream_queue = self._queues.setdefault(conversation_id, queue.Queue())
+
+        while True:
+            try:
+                event = stream_queue.get(timeout=keepalive_seconds)
+            except queue.Empty:
+                if stop_after_idle:
+                    return
+                yield {"event": "ping", "data": {"conversation_id": conversation_id}}
+                continue
+            request_id = event.get("data", {}).get("request_id")
+            if isinstance(request_id, str) and request_id:
+                try:
+                    request_coordinator.mark_followup_delivered(request_id)
+                except request_coordinator.RequestNotFoundError:
+                    logger.info(
+                        "followup delivery skipped missing request request_id=%s",
+                        request_id,
+                    )
+            yield event
+
+
+_followup_delivery_bus = FollowupDeliveryBus()
+_retrieval_executor_lock = threading.Lock()
+_retrieval_executor: ThreadPoolExecutor | None = None
 
 
 @dataclass
@@ -71,6 +157,8 @@ class DialogueDependencies:
     # Shared
     model_client: Any | None = None
     recent_history_limit: int = 20
+    followup_context_window_turns: int | None = None
+    retrieval_max_workers: int | None = None
 
     def with_overrides(self, **overrides: Any) -> "DialogueDependencies":
         return replace(self, **overrides)
@@ -130,6 +218,18 @@ def handle_chat_message(
         recent_history = deps.get_recent_history(
             conversation_id, deps.recent_history_limit
         )
+        snapshot = DialogueTurnSnapshot(
+            request_id=request_id,
+            turn_id=turn_id,
+            conversation_id=conversation_id,
+            user_message=message,
+            model_profile=model_profile,
+            user_profile=user_profile,
+            compact_history=compact_history,
+            recent_history=recent_history,
+            created_at=request_record["created_at"],
+        )
+        request_coordinator.attach_context_snapshot(request_id, snapshot.to_dict())
 
         initial = deps.generate_initial_reply(
             {
@@ -143,8 +243,23 @@ def handle_chat_message(
             model_client=deps.model_client,
         )
         reply_text = _require_reply_text(initial)
-        request_coordinator.mark_initial_reply(request_id, reply_text)
-        _save_assistant_turn(deps, conversation_id, reply_text, kind="initial")
+        initial_reply_turn_id = _save_assistant_turn(
+            deps,
+            conversation_id,
+            reply_text,
+            kind="initial",
+        )
+        snapshot = replace(
+            snapshot,
+            initial_reply=reply_text,
+            initial_reply_turn_id=initial_reply_turn_id,
+        )
+        request_coordinator.attach_context_snapshot(request_id, snapshot.to_dict())
+        request_coordinator.mark_initial_reply(
+            request_id,
+            reply_text,
+            assistant_turn_id=initial_reply_turn_id,
+        )
         logger.info(
             "initial reply generated request_id=%s conversation_id=%s reply_chars=%d",
             request_id,
@@ -158,14 +273,18 @@ def handle_chat_message(
             request_id,
             conversation_id,
         )
-        retrieval_status, retrieved_items = _run_retrieval(
-            deps=deps,
-            request_id=request_id,
-            user_message=message,
-            compact_history=compact_history,
-            recent_history=recent_history,
-            user_profile=user_profile,
+    except Exception as exc:
+        request_coordinator.mark_failed(request_id, str(exc) or exc.__class__.__name__)
+        logger.error(
+            "dialogue request failed request_id=%s conversation_id=%s reason=%r",
+            request_id,
+            conversation_id,
+            str(exc) or exc.__class__.__name__,
         )
+        raise
+
+    try:
+        retrieval_status, retrieved_items = _run_retrieval(deps=deps, snapshot=snapshot)
         request_coordinator.mark_retrieval_completed(request_id, retrieved_items)
         logger.info(
             "memory retrieval completed request_id=%s conversation_id=%s status=%s "
@@ -176,16 +295,35 @@ def handle_chat_message(
             len(retrieved_items),
             _memory_ids(retrieved_items),
         )
-        _run_followup_decision(deps, request_id)
     except Exception as exc:
-        request_coordinator.mark_failed(request_id, str(exc) or exc.__class__.__name__)
+        retrieval_status = RETRIEVAL_STATUS_FAILED
+        retrieved_items = []
+        request_coordinator.mark_retrieval_failed(
+            request_id,
+            str(exc) or exc.__class__.__name__,
+        )
         logger.error(
-            "dialogue request failed request_id=%s conversation_id=%s reason=%r",
+            "memory retrieval failed after initial reply request_id=%s "
+            "conversation_id=%s reason=%r",
             request_id,
             conversation_id,
             str(exc) or exc.__class__.__name__,
         )
-        raise
+    else:
+        try:
+            _run_followup_decision(deps, request_id, snapshot=snapshot)
+        except Exception as exc:
+            request_coordinator.mark_followup_failed(
+                request_id,
+                str(exc) or exc.__class__.__name__,
+            )
+            logger.error(
+                "followup decision failed after retrieval request_id=%s "
+                "conversation_id=%s reason=%r",
+                request_id,
+                conversation_id,
+                str(exc) or exc.__class__.__name__,
+            )
 
     return {
         "request_id": request_id,
@@ -220,9 +358,13 @@ def handle_chat_message_stream(
     request_id = request_record["request_id"]
     turn_id = request_record["turn_id"]
     reply_parts: list[str] = []
-    followup_queue: queue.Queue[dict] | None = (
-        queue.Queue(maxsize=1) if stream_followup else None
-    )
+    if stream_followup:
+        logger.info(
+            "stream_followup ignored request_id=%s conversation_id=%s "
+            "reason=followups_use_conversation_stream",
+            request_id,
+            conversation_id,
+        )
     logger.info(
         "dialogue request received request_id=%s turn_id=%s conversation_id=%s mode=stream",
         request_id,
@@ -238,6 +380,18 @@ def handle_chat_message_stream(
         recent_history = deps.get_recent_history(
             conversation_id, deps.recent_history_limit
         )
+        snapshot = DialogueTurnSnapshot(
+            request_id=request_id,
+            turn_id=turn_id,
+            conversation_id=conversation_id,
+            user_message=message,
+            model_profile=model_profile,
+            user_profile=user_profile,
+            compact_history=compact_history,
+            recent_history=recent_history,
+            created_at=request_record["created_at"],
+        )
+        request_coordinator.attach_context_snapshot(request_id, snapshot.to_dict())
 
         yield {
             "event": "meta",
@@ -270,8 +424,23 @@ def handle_chat_message_stream(
         reply_text = "".join(reply_parts).strip()
         if not reply_text:
             raise ValueError("generate_initial_reply_stream must produce a non-empty reply")
-        request_coordinator.mark_initial_reply(request_id, reply_text)
-        _save_assistant_turn(deps, conversation_id, reply_text, kind="initial")
+        initial_reply_turn_id = _save_assistant_turn(
+            deps,
+            conversation_id,
+            reply_text,
+            kind="initial",
+        )
+        snapshot = replace(
+            snapshot,
+            initial_reply=reply_text,
+            initial_reply_turn_id=initial_reply_turn_id,
+        )
+        request_coordinator.attach_context_snapshot(request_id, snapshot.to_dict())
+        request_coordinator.mark_initial_reply(
+            request_id,
+            reply_text,
+            assistant_turn_id=initial_reply_turn_id,
+        )
         logger.info(
             "initial reply generated request_id=%s conversation_id=%s reply_chars=%d mode=stream",
             request_id,
@@ -287,12 +456,7 @@ def handle_chat_message_stream(
         )
         _run_retrieval_in_background(
             deps=deps,
-            request_id=request_id,
-            user_message=message,
-            compact_history=compact_history,
-            recent_history=recent_history,
-            user_profile=user_profile,
-            followup_queue=followup_queue,
+            snapshot=snapshot,
         )
     except Exception as exc:
         request_coordinator.mark_failed(request_id, str(exc) or exc.__class__.__name__)
@@ -316,30 +480,28 @@ def handle_chat_message_stream(
         },
     }
 
-    if followup_queue is not None:
-        followup_result = followup_queue.get()
-        if followup_result.get("event") == "error":
-            yield {
-                "event": "followup_error",
-                "data": followup_result.get("data", {}),
-            }
-            return
 
-        followup_data = dict(followup_result.get("data", {}))
-        if followup_data.get("decision") == "followup":
-            reply = followup_data.get("reply") or ""
-            if reply:
-                yield {
-                    "event": "delta",
-                    "data": {
-                        "delta": reply,
-                        "phase": "followup",
-                        "followup_type": followup_data.get("followup_type"),
-                        "request_id": request_id,
-                        "conversation_id": conversation_id,
-                    },
-                }
-        yield {"event": "followup_done", "data": followup_data}
+def iter_followup_events(
+    conversation_id: str,
+    *,
+    keepalive_seconds: float = 15.0,
+    stop_after_idle: bool = False,
+) -> Iterator[dict]:
+    """Yield generated follow-up events for one conversation as SSE payloads."""
+
+    if not isinstance(conversation_id, str) or not conversation_id:
+        raise ValueError("conversation_id must be a non-empty string")
+    yield from _followup_delivery_bus.listen(
+        conversation_id,
+        keepalive_seconds=keepalive_seconds,
+        stop_after_idle=stop_after_idle,
+    )
+
+
+def reset_followup_delivery_bus() -> None:
+    """Clear in-memory follow-up delivery queues. Intended for tests."""
+
+    _followup_delivery_bus.reset()
 
 
 def handle_followup(
@@ -390,6 +552,8 @@ def handle_followup(
 def _run_followup_decision(
     deps: DialogueDependencies,
     request_id: str,
+    *,
+    snapshot: DialogueTurnSnapshot | None = None,
 ) -> dict:
     record = request_coordinator.get_request(request_id)
     if record["status"] in {"followup_generated", "no_followup_needed"}:
@@ -411,6 +575,7 @@ def _run_followup_decision(
 
     conversation_id = record["conversation_id"]
     retrieved_items = record.get("retrieved_items") or []
+    snapshot = snapshot or _snapshot_from_record(record)
     logger.info(
         "followup decision started request_id=%s conversation_id=%s retrieved_count=%d "
         "retrieved_ids=%s",
@@ -420,21 +585,43 @@ def _run_followup_decision(
         _memory_ids(retrieved_items),
     )
 
-    model_profile = deps.read_model_profile()
-    user_profile = deps.read_user_profile()
-    compact_history = deps.get_compact_history(conversation_id)
-    recent_history = deps.get_recent_history(conversation_id, deps.recent_history_limit)
+    context_window = _followup_context_window_turns(deps)
+    latest_recent_history = _read_history_window(
+        deps,
+        conversation_id,
+        context_window,
+    )
+    newer_turns = _newer_turns_since_original_request(
+        latest_recent_history,
+        snapshot.turn_id,
+        context_window,
+    )
 
     decision = deps.generate_followup_reply(
         {
             "request_id": request_id,
-            "model_profile": model_profile,
-            "user_profile": user_profile,
-            "compact_history": compact_history,
-            "recent_history": recent_history,
-            "original_user_query": record["user_message"],
-            "initial_reply": record.get("initial_reply") or "",
+            "conversation_id": conversation_id,
+            "parent_user_turn_id": snapshot.turn_id,
+            "parent_initial_reply_turn_id": snapshot.initial_reply_turn_id or "",
+            "original_user_query": snapshot.user_message,
+            "initial_reply": snapshot.initial_reply or "",
+            "original_context": {
+                "model_profile": snapshot.model_profile,
+                "user_profile": snapshot.user_profile,
+                "compact_history": snapshot.compact_history,
+                "recent_history": snapshot.recent_history,
+            },
+            "model_profile": snapshot.model_profile,
+            "user_profile": snapshot.user_profile,
+            "compact_history": snapshot.compact_history,
+            "recent_history": snapshot.recent_history,
             "retrieved_items": retrieved_items,
+            "latest_context": {
+                "recent_history": latest_recent_history,
+                "newer_turns_since_original_request": newer_turns,
+            },
+            "latest_recent_history": latest_recent_history,
+            "newer_turns_since_original_request": newer_turns,
             "current_conversation_state": "retrieval_completed",
         },
         model_client=deps.model_client,
@@ -442,12 +629,19 @@ def _run_followup_decision(
 
     normalized = _normalize_followup_decision(decision, request_id)
     if normalized["decision"] == "followup":
-        _save_assistant_turn(
+        followup_turn_id = _save_assistant_turn(
             deps,
             conversation_id,
             normalized["reply"],
             kind="followup",
+            metadata={
+                "parent_request_id": request_id,
+                "parent_user_turn_id": snapshot.turn_id,
+                "parent_initial_reply_turn_id": snapshot.initial_reply_turn_id,
+                "followup_type": normalized["followup_type"],
+            },
         )
+        normalized["followup_turn_id"] = followup_turn_id
         logger.info(
             "followup reply saved request_id=%s conversation_id=%s turn_kind=followup",
             request_id,
@@ -466,11 +660,18 @@ def _run_followup_decision(
         len(normalized.get("reply") or ""),
     )
 
-    return {
+    result = {
         "request_id": request_id,
         "conversation_id": conversation_id,
+        "parent_user_turn_id": snapshot.turn_id,
+        "parent_initial_reply_turn_id": snapshot.initial_reply_turn_id or "",
+        "original_user_query": snapshot.user_message,
+        "initial_reply": snapshot.initial_reply or "",
         **normalized,
     }
+    if normalized["decision"] == "followup":
+        _publish_followup_event(result)
+    return result
 
 
 def _save_user_turn(
@@ -495,17 +696,21 @@ def _save_assistant_turn(
     content: str,
     *,
     kind: str,
+    metadata: dict | None = None,
 ) -> str:
     from uuid import uuid4
 
     assistant_turn_id = f"turn_{uuid4().hex}"
+    metadata_json = {"turn_kind": kind}
+    if metadata:
+        metadata_json.update(metadata)
     deps.append_turn(
         conversation_id,
         {
             "turn_id": assistant_turn_id,
             "role": "assistant",
             "content": content,
-            "metadata_json": {"turn_kind": kind},
+            "metadata_json": metadata_json,
         },
     )
     return assistant_turn_id
@@ -514,12 +719,9 @@ def _save_assistant_turn(
 def _run_retrieval(
     *,
     deps: DialogueDependencies,
-    request_id: str,
-    user_message: str,
-    compact_history: str,
-    recent_history: list[dict],
-    user_profile: str,
+    snapshot: DialogueTurnSnapshot,
 ) -> tuple[str, list[dict]]:
+    request_id = snapshot.request_id
     lightweight_items = deps.list_lightweight_memory_items()
     if not isinstance(lightweight_items, list):
         raise TypeError("list_lightweight_memory_items must return a list")
@@ -542,10 +744,10 @@ def _run_retrieval(
     )
     retrieval = deps.retrieve_relevant_memory_ids(
         request_id=request_id,
-        current_query=user_message,
-        compact_history=compact_history,
-        recent_history=recent_history,
-        user_profile=user_profile,
+        current_query=snapshot.user_message,
+        compact_history=snapshot.compact_history,
+        recent_history=snapshot.recent_history,
+        user_profile=snapshot.user_profile,
         lightweight_memory_items=lightweight_items,
         model_client=deps.model_client,
     )
@@ -583,24 +785,13 @@ def _run_retrieval(
 def _run_retrieval_in_background(
     *,
     deps: DialogueDependencies,
-    request_id: str,
-    user_message: str,
-    compact_history: str,
-    recent_history: list[dict],
-    user_profile: str,
-    followup_queue: queue.Queue[dict] | None = None,
+    snapshot: DialogueTurnSnapshot,
 ) -> None:
     def _worker() -> None:
+        request_id = snapshot.request_id
         logger.info("memory retrieval background worker started request_id=%s", request_id)
         try:
-            _, retrieved_items = _run_retrieval(
-                deps=deps,
-                request_id=request_id,
-                user_message=user_message,
-                compact_history=compact_history,
-                recent_history=list(recent_history),
-                user_profile=user_profile,
-            )
+            _, retrieved_items = _run_retrieval(deps=deps, snapshot=snapshot)
             request_coordinator.mark_retrieval_completed(request_id, retrieved_items)
             logger.info(
                 "memory retrieval background worker completed request_id=%s "
@@ -609,12 +800,9 @@ def _run_retrieval_in_background(
                 len(retrieved_items),
                 _memory_ids(retrieved_items),
             )
-            followup = _run_followup_decision(deps, request_id)
-            if followup_queue is not None:
-                followup_queue.put({"event": "followup_done", "data": followup})
         except Exception as exc:  # pragma: no cover - defensive background guard
             try:
-                request_coordinator.mark_failed(
+                request_coordinator.mark_retrieval_failed(
                     request_id,
                     str(exc) or exc.__class__.__name__,
                 )
@@ -624,38 +812,176 @@ def _run_retrieval_in_background(
                     "request disappeared request_id=%s",
                     request_id,
                 )
-                if followup_queue is not None:
-                    followup_queue.put(
-                        {
-                            "event": "error",
-                            "data": {"message": f"unknown request_id: {request_id}"},
-                        }
-                    )
                 return
             logger.error(
                 "memory retrieval background worker failed request_id=%s reason=%r",
                 request_id,
                 str(exc) or exc.__class__.__name__,
             )
-            if followup_queue is not None:
-                followup_queue.put(
-                    {
-                        "event": "error",
-                        "data": {"message": str(exc) or exc.__class__.__name__},
-                    }
-                )
+            return
 
-    thread = threading.Thread(
-        target=_worker,
-        name=f"memory-retrieval-{request_id}",
-        daemon=True,
-    )
-    thread.start()
+        try:
+            _run_followup_decision(deps, request_id, snapshot=snapshot)
+        except Exception as exc:  # pragma: no cover - defensive background guard
+            try:
+                request_coordinator.mark_followup_failed(
+                    request_id,
+                    str(exc) or exc.__class__.__name__,
+                )
+            except request_coordinator.RequestNotFoundError:
+                logger.info(
+                    "followup background worker could not mark failed because "
+                    "request disappeared request_id=%s",
+                    request_id,
+                )
+                return
+            logger.error(
+                "followup background worker failed request_id=%s reason=%r",
+                request_id,
+                str(exc) or exc.__class__.__name__,
+            )
+
+    request_id = snapshot.request_id
+    executor = _get_retrieval_executor(deps)
+    executor.submit(_worker)
     logger.info(
-        "memory retrieval background worker scheduled request_id=%s thread_name=%s",
+        "memory retrieval background worker scheduled request_id=%s executor=%s",
         request_id,
-        thread.name,
+        executor,
     )
+
+
+def _snapshot_from_record(record: dict) -> DialogueTurnSnapshot:
+    stored = record.get("context_snapshot")
+    if isinstance(stored, dict):
+        return DialogueTurnSnapshot(
+            request_id=str(stored.get("request_id") or record["request_id"]),
+            turn_id=str(stored.get("turn_id") or record["turn_id"]),
+            conversation_id=str(stored.get("conversation_id") or record["conversation_id"]),
+            user_message=str(stored.get("user_message") or record["user_message"]),
+            model_profile=str(stored.get("model_profile") or ""),
+            user_profile=str(stored.get("user_profile") or ""),
+            compact_history=str(stored.get("compact_history") or ""),
+            recent_history=list(stored.get("recent_history") or []),
+            created_at=str(stored.get("created_at") or record["created_at"]),
+            initial_reply=stored.get("initial_reply") or record.get("initial_reply") or "",
+            initial_reply_turn_id=(
+                stored.get("initial_reply_turn_id")
+                or record.get("initial_reply_turn_id")
+                or ""
+            ),
+        )
+    return DialogueTurnSnapshot(
+        request_id=record["request_id"],
+        turn_id=record["turn_id"],
+        conversation_id=record["conversation_id"],
+        user_message=record["user_message"],
+        model_profile="",
+        user_profile="",
+        compact_history="",
+        recent_history=[],
+        created_at=record["created_at"],
+        initial_reply=record.get("initial_reply") or "",
+        initial_reply_turn_id=record.get("initial_reply_turn_id") or "",
+    )
+
+
+def _followup_context_window_turns(deps: DialogueDependencies) -> int:
+    if deps.followup_context_window_turns is not None:
+        return deps.followup_context_window_turns
+    try:
+        config = load_app_config()
+    except Exception:
+        return DEFAULT_FOLLOWUP_CONTEXT_WINDOW_TURNS
+    dialogue_config = config.get("dialogue")
+    if not isinstance(dialogue_config, dict):
+        return DEFAULT_FOLLOWUP_CONTEXT_WINDOW_TURNS
+    followup_config = dialogue_config.get("followup")
+    if not isinstance(followup_config, dict):
+        return DEFAULT_FOLLOWUP_CONTEXT_WINDOW_TURNS
+    value = followup_config.get("context_window_turns", DEFAULT_FOLLOWUP_CONTEXT_WINDOW_TURNS)
+    return value if isinstance(value, int) else DEFAULT_FOLLOWUP_CONTEXT_WINDOW_TURNS
+
+
+def _read_history_window(
+    deps: DialogueDependencies,
+    conversation_id: str,
+    context_window_turns: int,
+) -> list[dict]:
+    if context_window_turns == -1:
+        return deps.get_recent_history(conversation_id, 1_000_000)
+    if context_window_turns <= 0:
+        return []
+    return deps.get_recent_history(conversation_id, context_window_turns)
+
+
+def _newer_turns_since_original_request(
+    latest_recent_history: list[dict],
+    parent_user_turn_id: str,
+    context_window_turns: int,
+) -> list[dict]:
+    if not isinstance(latest_recent_history, list):
+        return []
+
+    start_index: int | None = None
+    for index, turn in enumerate(latest_recent_history):
+        if isinstance(turn, dict) and turn.get("turn_id") == parent_user_turn_id:
+            start_index = index + 1
+            break
+    if start_index is None:
+        newer = list(latest_recent_history)
+    else:
+        newer = list(latest_recent_history[start_index:])
+
+    if context_window_turns != -1 and context_window_turns >= 0:
+        newer = newer[-context_window_turns:]
+    return [dict(turn) for turn in newer if isinstance(turn, dict)]
+
+
+def _publish_followup_event(result: dict) -> None:
+    payload = {
+        "conversation_id": result["conversation_id"],
+        "request_id": result["request_id"],
+        "parent_user_turn_id": result.get("parent_user_turn_id", ""),
+        "parent_initial_reply_turn_id": result.get("parent_initial_reply_turn_id", ""),
+        "followup_turn_id": result.get("followup_turn_id", ""),
+        "original_user_query": result.get("original_user_query", ""),
+        "initial_reply": result.get("initial_reply", ""),
+        "followup_type": result.get("followup_type", "supplement"),
+        "reply": result.get("reply", ""),
+    }
+    _followup_delivery_bus.publish(result["conversation_id"], payload)
+
+
+def _get_retrieval_executor(deps: DialogueDependencies) -> ThreadPoolExecutor:
+    global _retrieval_executor
+
+    with _retrieval_executor_lock:
+        if _retrieval_executor is None:
+            _retrieval_executor = ThreadPoolExecutor(
+                max_workers=_retrieval_max_workers(deps),
+                thread_name_prefix="memory-retrieval",
+            )
+        return _retrieval_executor
+
+
+def _retrieval_max_workers(deps: DialogueDependencies) -> int:
+    if deps.retrieval_max_workers is not None:
+        return max(1, deps.retrieval_max_workers)
+    try:
+        config = load_app_config()
+    except Exception:
+        return DEFAULT_RETRIEVAL_MAX_WORKERS
+    dialogue_config = config.get("dialogue")
+    if not isinstance(dialogue_config, dict):
+        return DEFAULT_RETRIEVAL_MAX_WORKERS
+    retrieval_config = dialogue_config.get("retrieval")
+    if not isinstance(retrieval_config, dict):
+        return DEFAULT_RETRIEVAL_MAX_WORKERS
+    value = retrieval_config.get("max_workers", DEFAULT_RETRIEVAL_MAX_WORKERS)
+    if not isinstance(value, int):
+        return DEFAULT_RETRIEVAL_MAX_WORKERS
+    return max(1, value)
 
 
 def _require_reply_text(initial: Any) -> str:

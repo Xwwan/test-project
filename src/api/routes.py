@@ -50,6 +50,7 @@ from src.services import (
     handle_chat_message,
     handle_chat_message_stream,
     handle_followup,
+    iter_followup_events,
     refresh_user_profile,
 )
 from src.services.reply_tags import prepare_tts_text
@@ -361,7 +362,6 @@ def iter_voice_live_finish_stream(
         request.conversation_id,
         transcript,
         dependencies=dependencies,
-        stream_followup=True,
     ):
         if item.get("event") == "done":
             data = dict(item.get("data", {}))
@@ -594,6 +594,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         if method == "GET" and urlsplit(self.path).path == "/tools/voice-latency":
             self._write_html_file(_VOICE_LATENCY_PAGE)
             return
+        if method == "GET" and urlsplit(self.path).path == "/followups/stream":
+            self._write_followups_stream()
+            return
 
         body: Any = None
         if method == "POST":
@@ -638,11 +641,42 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 request.conversation_id,
                 request.message,
                 dependencies=type(self).injected_dependencies,
-                stream_followup=True,
             ):
                 event = item.get("event", "message")
                 data = item.get("data", {})
                 self._write_sse_event(event, data)
+        except Exception as exc:  # pragma: no cover - defensive network path
+            self._write_sse_event(
+                "error",
+                {"message": str(exc) or exc.__class__.__name__},
+            )
+
+    def _write_followups_stream(self) -> None:
+        from urllib.parse import parse_qs
+
+        query = parse_qs(urlsplit(self.path).query)
+        conversation_id = (query.get("conversation_id") or [""])[0]
+        if not conversation_id:
+            self._write_json(
+                400,
+                {"error": {"message": "conversation_id must be a non-empty string"}},
+            )
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        try:
+            for item in iter_followup_events(conversation_id):
+                self._write_sse_event(item.get("event", "message"), item.get("data", {}))
+        except (BrokenPipeError, ConnectionResetError):  # pragma: no cover - network path
+            logger.info(
+                "followup stream client disconnected conversation_id=%s",
+                conversation_id,
+            )
         except Exception as exc:  # pragma: no cover - defensive network path
             self._write_sse_event(
                 "error",

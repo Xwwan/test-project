@@ -16,7 +16,9 @@ from src.services import (
     handle_chat_message,
     handle_chat_message_stream,
     handle_followup,
+    iter_followup_events,
     refresh_user_profile,
+    reset_followup_delivery_bus,
 )
 
 
@@ -201,9 +203,11 @@ def _wait_until(predicate, *, timeout: float = 2.0) -> None:
 class DialogueServiceTest(unittest.TestCase):
     def setUp(self) -> None:
         request_coordinator.reset_store()
+        reset_followup_delivery_bus()
 
     def tearDown(self) -> None:
         request_coordinator.reset_store()
+        reset_followup_delivery_bus()
 
     def test_handle_chat_message_returns_first_reply_and_binds_ids(self) -> None:
         initial = RecordingInitialReplyFn(reply="你好，小明！")
@@ -323,6 +327,110 @@ class DialogueServiceTest(unittest.TestCase):
         assert request_id not in pending_ids
         assert request_coordinator.get_request(request_id)["status"] == "no_followup_needed"
 
+    def test_each_stream_request_uses_its_own_retrieval_snapshot(self) -> None:
+        allow_a_retrieval_finish = threading.Event()
+        retrieval_queries: list[str] = []
+        followup_inputs: list[dict] = []
+        convo = FakeConversationStore()
+        memory = FakeMemoryStore(
+            lightweight=[
+                {"id": 7, "summary": "A 相关记忆", "memory_type": "task"},
+                {"id": 8, "summary": "B 相关记忆", "memory_type": "task"},
+            ]
+        )
+
+        def retrieval(**kwargs: Any) -> dict:
+            query = kwargs["current_query"]
+            retrieval_queries.append(query)
+            if query == "问题 A" and not allow_a_retrieval_finish.wait(timeout=2):
+                raise AssertionError("A retrieval was not released")
+            selected_id = 7 if query == "问题 A" else 8
+            return {
+                "request_id": kwargs["request_id"],
+                "selected_memory_ids": [selected_id],
+            }
+
+        def followup(input_data: dict, **kwargs: Any) -> dict:
+            followup_inputs.append(input_data)
+            return {
+                "request_id": input_data["request_id"],
+                "decision": "followup",
+                "followup_type": "supplement",
+                "reply": f"补充 {input_data['original_user_query']}",
+            }
+
+        deps = _build_deps(
+            conversation_store=convo,
+            memory_store=memory,
+            initial_reply_stream_fn=RecordingInitialReplyStreamFn(chunks=["首答"]),
+            retrieval_fn=retrieval,
+            followup_fn=followup,
+        )
+
+        events_a = list(handle_chat_message_stream("conv-1", "问题 A", dependencies=deps))
+        events_b = list(handle_chat_message_stream("conv-1", "问题 B", dependencies=deps))
+        request_a = events_a[-1]["data"]["request_id"]
+        request_b = events_b[-1]["data"]["request_id"]
+
+        _wait_until(
+            lambda: request_coordinator.get_request(request_b)["status"]
+            == "followup_generated"
+        )
+        allow_a_retrieval_finish.set()
+        _wait_until(
+            lambda: request_coordinator.get_request(request_a)["status"]
+            == "followup_generated"
+        )
+
+        assert sorted(retrieval_queries) == ["问题 A", "问题 B"]
+        by_query = {item["original_user_query"]: item for item in followup_inputs}
+        assert by_query["问题 A"]["original_context"]["recent_history"][-1]["content"] == "问题 A"
+        newer_after_a = [
+            turn["content"]
+            for turn in by_query["问题 A"]["latest_context"][
+                "newer_turns_since_original_request"
+            ]
+        ]
+        assert "问题 B" in newer_after_a
+        assert by_query["问题 B"]["original_context"]["recent_history"][-1]["content"] == "问题 B"
+
+        followup_events = list(
+            iter_followup_events("conv-1", keepalive_seconds=0.01, stop_after_idle=True)
+        )
+        event_request_ids = [event["data"]["request_id"] for event in followup_events]
+        assert set(event_request_ids) == {request_a, request_b}
+        for event in followup_events:
+            if event["data"]["request_id"] == request_a:
+                assert event["data"]["original_user_query"] == "问题 A"
+            if event["data"]["request_id"] == request_b:
+                assert event["data"]["original_user_query"] == "问题 B"
+
+    def test_background_retrieval_failure_does_not_fail_initial_reply(self) -> None:
+        memory = FakeMemoryStore(lightweight=[{"id": 7, "summary": "x"}])
+
+        def failing_retrieval(**kwargs: Any) -> dict:
+            raise RuntimeError("retrieval timeout")
+
+        deps = _build_deps(
+            memory_store=memory,
+            initial_reply_stream_fn=RecordingInitialReplyStreamFn(chunks=["好"]),
+            retrieval_fn=failing_retrieval,
+        )
+
+        events = list(handle_chat_message_stream("conv-1", "你好", dependencies=deps))
+        request_id = events[-1]["data"]["request_id"]
+
+        assert [event["event"] for event in events] == ["meta", "delta", "done"]
+        assert events[-1]["data"]["reply"] == "好"
+        _wait_until(
+            lambda: request_coordinator.get_request(request_id)["retrieval_status"]
+            == "failed"
+        )
+        record = request_coordinator.get_request(request_id)
+        assert record["status"] == "retrieval_failed"
+        assert record["initial_reply"] == "好"
+        assert "retrieval timeout" in record["retrieval_error"]
+
     def test_handle_chat_message_stream_auto_runs_followup_after_background_retrieval(self) -> None:
         convo = FakeConversationStore()
         memory = FakeMemoryStore(
@@ -355,14 +463,36 @@ class DialogueServiceTest(unittest.TestCase):
         assert record["followup_decision"]["decision"] == "followup"
         assert followup.last_input is not None
         assert [item["id"] for item in followup.last_input["retrieved_items"]] == [7]
+        assert followup.last_input["original_user_query"] == "你认识季羡林吗？"
+        assert followup.last_input["initial_reply"] == "好"
+        assert followup.last_input["original_context"]["recent_history"][0]["content"] == (
+            "你认识季羡林吗？"
+        )
+        assert followup.last_input["latest_context"]["recent_history"][-1]["content"] == "好"
+        assert followup.last_input["latest_context"][
+            "newer_turns_since_original_request"
+        ][0]["content"] == "好"
         assistant_turns = [turn for _, turn in convo.turns if turn["role"] == "assistant"]
         assert [turn["metadata_json"]["turn_kind"] for turn in assistant_turns] == [
             "initial",
             "followup",
         ]
+        assert assistant_turns[-1]["metadata_json"]["parent_request_id"] == request_id
+        assert assistant_turns[-1]["metadata_json"]["parent_user_turn_id"] == (
+            events[-1]["data"]["turn_id"]
+        )
         assert request_coordinator.get_pending_followup_requests() == []
 
-    def test_handle_chat_message_stream_can_emit_followup_delta(self) -> None:
+        followup_events = list(
+            iter_followup_events("conv-1", keepalive_seconds=0.01, stop_after_idle=True)
+        )
+        assert [event["event"] for event in followup_events] == ["followup"]
+        assert followup_events[0]["data"]["request_id"] == request_id
+        assert followup_events[0]["data"]["parent_user_turn_id"] == events[-1]["data"]["turn_id"]
+        assert followup_events[0]["data"]["original_user_query"] == "你认识季羡林吗？"
+        assert followup_events[0]["data"]["initial_reply"] == "好"
+
+    def test_handle_chat_message_stream_does_not_emit_followup_delta(self) -> None:
         memory = FakeMemoryStore(
             lightweight=[{"id": 7, "summary": "用户喜欢季羡林", "memory_type": "preference"}]
         )
@@ -393,18 +523,18 @@ class DialogueServiceTest(unittest.TestCase):
             "meta",
             "delta",
             "done",
-            "delta",
-            "followup_done",
         ]
-        assert events[3]["data"] == {
-            "delta": "顺便补充：你之前提过也喜欢季羡林。",
-            "phase": "followup",
-            "followup_type": "supplement",
-            "request_id": events[-1]["data"]["request_id"],
-            "conversation_id": "conv-1",
-        }
-        assert events[-1]["data"]["decision"] == "followup"
-        assert events[-1]["data"]["reply"] == "顺便补充：你之前提过也喜欢季羡林。"
+        request_id = events[-1]["data"]["request_id"]
+        _wait_until(
+            lambda: request_coordinator.get_request(request_id)["status"]
+            == "followup_generated"
+        )
+        followup_events = list(
+            iter_followup_events("conv-1", keepalive_seconds=0.01, stop_after_idle=True)
+        )
+        assert [event["event"] for event in followup_events] == ["followup"]
+        assert followup_events[0]["data"]["reply"] == "顺便补充：你之前提过也喜欢季羡林。"
+        assert followup_events[0]["data"]["request_id"] == request_id
 
     def test_handle_chat_message_stream_falls_back_to_one_shot_reply(self) -> None:
         deps = _build_deps(initial_reply_fn=RecordingInitialReplyFn(reply="完整回复"))

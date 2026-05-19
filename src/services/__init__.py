@@ -10,6 +10,8 @@ from .dialogue_service import (
     handle_chat_message,
     handle_chat_message_stream,
     handle_followup,
+    iter_followup_events,
+    reset_followup_delivery_bus,
 )
 from .memory_service import (
     apply_operations,
@@ -24,5 +26,7 @@ __all__ = [
     "handle_chat_message",
     "handle_chat_message_stream",
     "handle_followup",
+    "iter_followup_events",
     "refresh_user_profile",
+    "reset_followup_delivery_bus",
 ]

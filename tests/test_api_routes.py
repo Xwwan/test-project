@@ -16,7 +16,7 @@ import unittest
 
 from src.api.routes import ChatRequestHandler, build_app, dispatch
 from src.coordinator import request_coordinator
-from src.services import DialogueDependencies
+from src.services import DialogueDependencies, reset_followup_delivery_bus
 
 
 class FakeConversationStore:
@@ -110,9 +110,11 @@ def _build_dependencies(
 class ApiRoutesTest(unittest.TestCase):
     def setUp(self) -> None:
         request_coordinator.reset_store()
+        reset_followup_delivery_bus()
 
     def tearDown(self) -> None:
         request_coordinator.reset_store()
+        reset_followup_delivery_bus()
 
     def test_post_chat_returns_200_with_chat_response(self) -> None:
         deps, _, _ = _build_dependencies(initial_reply="你好，小明！")
@@ -144,12 +146,10 @@ class ApiRoutesTest(unittest.TestCase):
             "meta",
             "delta",
             "done",
-            "followup_done",
         ]
         assert events[2]["data"]["reply"] == "你好"
         assert events[2]["data"]["retrieval_status"] == "pending"
         assert events[2]["data"]["retrieved_memory_ids"] == []
-        assert events[-1]["data"]["decision"] == "no_followup"
 
     def test_build_app_defaults_to_threading_http_server(self) -> None:
         default = inspect.signature(build_app).parameters["server_class"].default

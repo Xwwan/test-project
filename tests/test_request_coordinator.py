@@ -16,8 +16,11 @@ from src.coordinator import (
     get_request,
     mark_failed,
     mark_followup_decision,
+    mark_followup_delivered,
+    mark_followup_failed,
     mark_initial_reply,
     mark_retrieval_completed,
+    mark_retrieval_failed,
     mark_retrieval_pending,
     reset_store,
 )
@@ -82,6 +85,8 @@ class RequestCoordinatorTest(unittest.TestCase):
         final = get_request(request_id)
         assert final["status"] == "no_followup_needed"
         assert final["followup_decision"]["decision"] == "no_followup"
+        assert final["retrieval_status"] == "completed"
+        assert final["followup_status"] == "no_followup"
 
 
     def test_retrieval_completed_without_pending_step_is_allowed(self) -> None:
@@ -132,6 +137,33 @@ class RequestCoordinatorTest(unittest.TestCase):
         assert final["status"] == "followup_generated"
         assert final["followup_decision"]["decision"] == "followup"
         assert final["followup_decision"]["reply"] == "I remember you like coffee."
+        assert final["delivery_status"] == "pending"
+
+        mark_followup_delivered(request_id)
+        assert get_request(request_id)["delivery_status"] == "delivered"
+
+
+    def test_retrieval_and_followup_failures_do_not_use_global_failed_status(self) -> None:
+        retrieval_record = create_request("conv-1", "hello")
+        mark_initial_reply(retrieval_record["request_id"], "hi")
+        mark_retrieval_pending(retrieval_record["request_id"])
+        mark_retrieval_failed(retrieval_record["request_id"], "retrieval timeout")
+
+        failed_retrieval = get_request(retrieval_record["request_id"])
+        assert failed_retrieval["status"] == "retrieval_failed"
+        assert failed_retrieval["retrieval_status"] == "failed"
+        assert failed_retrieval["retrieval_error"] == "retrieval timeout"
+
+        followup_record = create_request("conv-1", "hello again")
+        mark_initial_reply(followup_record["request_id"], "hi")
+        mark_retrieval_completed(followup_record["request_id"], [])
+        mark_followup_failed(followup_record["request_id"], "followup timeout")
+
+        failed_followup = get_request(followup_record["request_id"])
+        assert failed_followup["status"] == "followup_failed"
+        assert failed_followup["retrieval_status"] == "completed"
+        assert failed_followup["followup_status"] == "failed"
+        assert failed_followup["followup_error"] == "followup timeout"
 
 
     def test_mark_failed_clears_pending_followup_and_records_reason(self) -> None:
@@ -211,8 +243,10 @@ class RequestCoordinatorTest(unittest.TestCase):
             "initial_reply_generated",
             "retrieval_pending",
             "retrieval_completed",
+            "retrieval_failed",
             "followup_generated",
             "no_followup_needed",
+            "followup_failed",
             "completed",
             "failed",
         }

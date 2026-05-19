@@ -1,7 +1,17 @@
 # 多轮异步记忆检索与二次回复解耦计划
 
-> **状态：设计中，待实现。** 本计划接续
+> **状态：已实现，2026-05-19。** 本计划接续
 > [流式回复完成与记忆检索解耦改造计划](2026-05-18-streaming-reply-retrieval-decoupling.md)，目标是在多轮对话中支持每一轮 query 独立触发异步记忆检索，并在检索乱序完成时安全地产生或跳过二次回复，避免上下文串线和流式输出串线。
+
+## 实现记录
+
+- `src/services/dialogue_service.py` 已增加 `DialogueTurnSnapshot`，每轮 query 在进入系统后固定保存原始 `Model.md`、`User.md`、compact history、recent history、原始 user turn、initial reply 与 initial assistant turn。
+- 后台 memory retrieval 已改为进程内 `ThreadPoolExecutor`，并通过 `config/app.yaml` 的 `dialogue.retrieval.max_workers` 控制并发数。
+- `/chat/stream` 只输出 `meta`、initial `delta` 和 `done`，不再等待或输出二次回复。
+- 新增 conversation 级 follow-up 投递队列和 `GET /followups/stream?conversation_id=...` SSE 通道，事件名为 `followup`，事件数据带 `request_id`、父 user turn、父 initial assistant turn、原始问题和初始回复。
+- follow-up decision 输入已拆分为 Original Request Context 与 Latest Conversation Context，最新上下文窗口由 `dialogue.followup.context_window_turns` 控制。
+- follow-up assistant turn 已写入父关系 metadata：`turn_kind`、`parent_request_id`、`parent_user_turn_id`、`parent_initial_reply_turn_id`、`followup_type`。
+- request coordinator 已拆分记录 `retrieval_status/retrieval_error`、`followup_status/followup_error`、`delivery_status`，后台 retrieval 或 follow-up 失败不会把已经完成的 initial reply 标为全局 `failed`。
 
 ## 背景
 
