@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
@@ -64,6 +65,9 @@ from .schemas import (
 
 
 JSONResponse = tuple[int, dict]
+
+
+logger = logging.getLogger("chat-service.api")
 
 
 _FOLLOWUP_RUN_PATTERN = re.compile(r"^/followups/(?P<request_id>[^/]+)/run$")
@@ -326,6 +330,59 @@ def iter_voice_latency_finish_stream(
     yield done_event
 
 
+def iter_voice_live_finish_stream(
+    request: LiveVoiceFinishRequest,
+    *,
+    dependencies: DialogueDependencies | None = None,
+    audio_dependencies: AudioDependencies | None = None,
+    live_asr_manager: LiveAsrSessionManager | None = None,
+):
+    """Finish live ASR and stream the normal persisted dialogue reply."""
+
+    manager = live_asr_manager or get_default_live_asr_manager()
+    state = manager.finish_session(request.session_id)
+    if state.error:
+        raise ValueError(state.error)
+    transcript = state.transcript.strip()
+    if not transcript:
+        raise ValueError("speech recognition produced an empty transcript")
+
+    yield {
+        "event": "transcript",
+        "data": {
+            "session_id": request.session_id,
+            "conversation_id": request.conversation_id,
+            "transcript": transcript,
+        },
+    }
+
+    done_sent = False
+    for item in handle_chat_message_stream(
+        request.conversation_id,
+        transcript,
+        dependencies=dependencies,
+        stream_followup=True,
+    ):
+        if item.get("event") == "done":
+            data = dict(item.get("data", {}))
+            data["transcript"] = transcript
+            data["audio_base64"] = None
+            data["audio_format"] = "pcm"
+            if request.tts_enabled:
+                reply = data.get("reply") or ""
+                yield from _iter_tts_audio_events(
+                    reply,
+                    audio_dependencies=audio_dependencies,
+                )
+            yield {"event": "done", "data": data}
+            done_sent = True
+            continue
+        yield item
+
+    if not done_sent:
+        return
+
+
 def _post_voice_live_abort(
     body: Any,
     live_asr_manager: LiveAsrSessionManager | None,
@@ -338,6 +395,11 @@ def _post_voice_live_abort(
 
 def _get_pending_followups() -> JSONResponse:
     pending = get_pending_followup_requests()
+    logger.info(
+        "followup pending listed pending_count=%d request_ids=%s",
+        len(pending),
+        [record["request_id"] for record in pending],
+    )
     return 200, {
         "pending": [
             {
@@ -355,6 +417,7 @@ def _post_followup_run(
     request_id: str,
     dependencies: DialogueDependencies | None,
 ) -> JSONResponse:
+    logger.info("followup run requested request_id=%s", request_id)
     payload = handle_followup(request_id, dependencies=dependencies)
     response = FollowupDecisionResponse(
         request_id=payload["request_id"],
@@ -540,6 +603,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             if urlsplit(self.path).path == "/chat/stream":
                 self._write_chat_stream(body)
                 return
+            if urlsplit(self.path).path == "/voice/live/finish-stream":
+                self._write_voice_live_stream(body)
+                return
             if urlsplit(self.path).path == "/tools/voice-latency/finish-stream":
                 self._write_voice_latency_stream(body)
                 return
@@ -572,6 +638,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 request.conversation_id,
                 request.message,
                 dependencies=type(self).injected_dependencies,
+                stream_followup=True,
             ):
                 event = item.get("event", "message")
                 data = item.get("data", {})
@@ -598,6 +665,33 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         try:
             for item in iter_voice_latency_finish_stream(
                 request,
+                audio_dependencies=type(self).injected_audio_dependencies,
+                live_asr_manager=type(self).injected_live_asr_manager,
+            ):
+                self._write_sse_event(item.get("event", "message"), item.get("data", {}))
+        except Exception as exc:  # pragma: no cover - defensive network path
+            self._write_sse_event(
+                "error",
+                {"message": str(exc) or exc.__class__.__name__},
+            )
+
+    def _write_voice_live_stream(self, body: Any) -> None:
+        try:
+            request = LiveVoiceFinishRequest.from_dict(body or {})
+        except SchemaError as exc:
+            self._write_json(400, {"error": {"message": str(exc)}})
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        try:
+            for item in iter_voice_live_finish_stream(
+                request,
+                dependencies=type(self).injected_dependencies,
                 audio_dependencies=type(self).injected_audio_dependencies,
                 live_asr_manager=type(self).injected_live_asr_manager,
             ):

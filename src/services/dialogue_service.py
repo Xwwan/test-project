@@ -17,11 +17,16 @@ Public entry points:
 
 from __future__ import annotations
 
+import logging
+import queue
 import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator
 
 from src.coordinator import request_coordinator
+
+
+logger = logging.getLogger("chat-service.dialogue")
 
 
 # A retrieval status reported back to the caller of ``/chat``. The MVP always
@@ -110,6 +115,12 @@ def handle_chat_message(
     request_record = request_coordinator.create_request(conversation_id, message)
     request_id = request_record["request_id"]
     turn_id = request_record["turn_id"]
+    logger.info(
+        "dialogue request received request_id=%s turn_id=%s conversation_id=%s mode=sync",
+        request_id,
+        turn_id,
+        conversation_id,
+    )
 
     try:
         _save_user_turn(deps, conversation_id, turn_id, message)
@@ -134,8 +145,19 @@ def handle_chat_message(
         reply_text = _require_reply_text(initial)
         request_coordinator.mark_initial_reply(request_id, reply_text)
         _save_assistant_turn(deps, conversation_id, reply_text, kind="initial")
+        logger.info(
+            "initial reply generated request_id=%s conversation_id=%s reply_chars=%d",
+            request_id,
+            conversation_id,
+            len(reply_text),
+        )
 
         request_coordinator.mark_retrieval_pending(request_id)
+        logger.info(
+            "memory retrieval marked pending request_id=%s conversation_id=%s mode=sync",
+            request_id,
+            conversation_id,
+        )
         retrieval_status, retrieved_items = _run_retrieval(
             deps=deps,
             request_id=request_id,
@@ -145,8 +167,24 @@ def handle_chat_message(
             user_profile=user_profile,
         )
         request_coordinator.mark_retrieval_completed(request_id, retrieved_items)
+        logger.info(
+            "memory retrieval completed request_id=%s conversation_id=%s status=%s "
+            "retrieved_count=%d retrieved_ids=%s followup_auto_run=true",
+            request_id,
+            conversation_id,
+            retrieval_status,
+            len(retrieved_items),
+            _memory_ids(retrieved_items),
+        )
+        _run_followup_decision(deps, request_id)
     except Exception as exc:
         request_coordinator.mark_failed(request_id, str(exc) or exc.__class__.__name__)
+        logger.error(
+            "dialogue request failed request_id=%s conversation_id=%s reason=%r",
+            request_id,
+            conversation_id,
+            str(exc) or exc.__class__.__name__,
+        )
         raise
 
     return {
@@ -164,6 +202,7 @@ def handle_chat_message_stream(
     message: str,
     *,
     dependencies: DialogueDependencies | None = None,
+    stream_followup: bool = False,
 ) -> Iterator[dict]:
     """Run ``/chat`` orchestration while yielding the initial reply as deltas.
 
@@ -181,6 +220,15 @@ def handle_chat_message_stream(
     request_id = request_record["request_id"]
     turn_id = request_record["turn_id"]
     reply_parts: list[str] = []
+    followup_queue: queue.Queue[dict] | None = (
+        queue.Queue(maxsize=1) if stream_followup else None
+    )
+    logger.info(
+        "dialogue request received request_id=%s turn_id=%s conversation_id=%s mode=stream",
+        request_id,
+        turn_id,
+        conversation_id,
+    )
 
     try:
         _save_user_turn(deps, conversation_id, turn_id, message)
@@ -224,8 +272,19 @@ def handle_chat_message_stream(
             raise ValueError("generate_initial_reply_stream must produce a non-empty reply")
         request_coordinator.mark_initial_reply(request_id, reply_text)
         _save_assistant_turn(deps, conversation_id, reply_text, kind="initial")
+        logger.info(
+            "initial reply generated request_id=%s conversation_id=%s reply_chars=%d mode=stream",
+            request_id,
+            conversation_id,
+            len(reply_text),
+        )
 
         request_coordinator.mark_retrieval_pending(request_id)
+        logger.info(
+            "memory retrieval marked pending request_id=%s conversation_id=%s mode=background",
+            request_id,
+            conversation_id,
+        )
         _run_retrieval_in_background(
             deps=deps,
             request_id=request_id,
@@ -233,9 +292,16 @@ def handle_chat_message_stream(
             compact_history=compact_history,
             recent_history=recent_history,
             user_profile=user_profile,
+            followup_queue=followup_queue,
         )
     except Exception as exc:
         request_coordinator.mark_failed(request_id, str(exc) or exc.__class__.__name__)
+        logger.error(
+            "dialogue request failed request_id=%s conversation_id=%s mode=stream reason=%r",
+            request_id,
+            conversation_id,
+            str(exc) or exc.__class__.__name__,
+        )
         raise
 
     yield {
@@ -249,6 +315,31 @@ def handle_chat_message_stream(
             "retrieved_memory_ids": [],
         },
     }
+
+    if followup_queue is not None:
+        followup_result = followup_queue.get()
+        if followup_result.get("event") == "error":
+            yield {
+                "event": "followup_error",
+                "data": followup_result.get("data", {}),
+            }
+            return
+
+        followup_data = dict(followup_result.get("data", {}))
+        if followup_data.get("decision") == "followup":
+            reply = followup_data.get("reply") or ""
+            if reply:
+                yield {
+                    "event": "delta",
+                    "data": {
+                        "delta": reply,
+                        "phase": "followup",
+                        "followup_type": followup_data.get("followup_type"),
+                        "request_id": request_id,
+                        "conversation_id": conversation_id,
+                    },
+                }
+        yield {"event": "followup_done", "data": followup_data}
 
 
 def handle_followup(
@@ -265,6 +356,53 @@ def handle_followup(
 
     deps = (dependencies or DialogueDependencies()).resolved()
     record = request_coordinator.get_request(request_id)
+    if record["status"] in {"followup_generated", "no_followup_needed"}:
+        decision = record.get("followup_decision")
+        if isinstance(decision, dict):
+            logger.info(
+                "followup decision already completed request_id=%s conversation_id=%s "
+                "decision=%s followup_type=%s",
+                request_id,
+                record["conversation_id"],
+                decision.get("decision"),
+                decision.get("followup_type"),
+            )
+            return {
+                "request_id": request_id,
+                "conversation_id": record["conversation_id"],
+                **decision,
+            }
+
+    if record["status"] != "retrieval_completed":
+        raise request_coordinator.RequestStateError(
+            f"request {request_id} is in status {record['status']!r}, "
+            "expected retrieval_completed before running follow-up"
+        )
+
+    return _run_followup_decision(deps, request_id)
+
+
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+
+def _run_followup_decision(
+    deps: DialogueDependencies,
+    request_id: str,
+) -> dict:
+    record = request_coordinator.get_request(request_id)
+    if record["status"] in {"followup_generated", "no_followup_needed"}:
+        decision = record.get("followup_decision")
+        if not isinstance(decision, dict):
+            raise request_coordinator.RequestStateError(
+                f"request {request_id} is already finalized without a follow-up decision"
+            )
+        return {
+            "request_id": request_id,
+            "conversation_id": record["conversation_id"],
+            **decision,
+        }
     if record["status"] != "retrieval_completed":
         raise request_coordinator.RequestStateError(
             f"request {request_id} is in status {record['status']!r}, "
@@ -273,6 +411,14 @@ def handle_followup(
 
     conversation_id = record["conversation_id"]
     retrieved_items = record.get("retrieved_items") or []
+    logger.info(
+        "followup decision started request_id=%s conversation_id=%s retrieved_count=%d "
+        "retrieved_ids=%s",
+        request_id,
+        conversation_id,
+        len(retrieved_items),
+        _memory_ids(retrieved_items),
+    )
 
     model_profile = deps.read_model_profile()
     user_profile = deps.read_user_profile()
@@ -295,7 +441,6 @@ def handle_followup(
     )
 
     normalized = _normalize_followup_decision(decision, request_id)
-    request_coordinator.mark_followup_decision(request_id, normalized)
     if normalized["decision"] == "followup":
         _save_assistant_turn(
             deps,
@@ -303,17 +448,29 @@ def handle_followup(
             normalized["reply"],
             kind="followup",
         )
+        logger.info(
+            "followup reply saved request_id=%s conversation_id=%s turn_kind=followup",
+            request_id,
+            conversation_id,
+        )
+
+    request_coordinator.mark_followup_decision(request_id, normalized)
+    logger.info(
+        "followup decision completed request_id=%s conversation_id=%s "
+        "second_reply_enabled=%s decision=%s followup_type=%s reply_chars=%d",
+        request_id,
+        conversation_id,
+        normalized["decision"] == "followup",
+        normalized["decision"],
+        normalized["followup_type"],
+        len(normalized.get("reply") or ""),
+    )
 
     return {
         "request_id": request_id,
         "conversation_id": conversation_id,
         **normalized,
     }
-
-
-# ---------------------------------------------------------------------------
-# Internals
-# ---------------------------------------------------------------------------
 
 
 def _save_user_turn(
@@ -366,9 +523,23 @@ def _run_retrieval(
     lightweight_items = deps.list_lightweight_memory_items()
     if not isinstance(lightweight_items, list):
         raise TypeError("list_lightweight_memory_items must return a list")
+    logger.info(
+        "memory retrieval lightweight scan request_id=%s lightweight_count=%d",
+        request_id,
+        len(lightweight_items),
+    )
     if not lightweight_items:
+        logger.info(
+            "memory retrieval skipped request_id=%s reason=no_lightweight_memory_items",
+            request_id,
+        )
         return RETRIEVAL_STATUS_COMPLETED, []
 
+    logger.info(
+        "memory retrieval agent started request_id=%s lightweight_ids=%s",
+        request_id,
+        _memory_ids(lightweight_items),
+    )
     retrieval = deps.retrieve_relevant_memory_ids(
         request_id=request_id,
         current_query=user_message,
@@ -379,12 +550,33 @@ def _run_retrieval(
         model_client=deps.model_client,
     )
     selected_ids = retrieval.get("selected_memory_ids") if isinstance(retrieval, dict) else None
+    retrieval_reason = retrieval.get("retrieval_reason") if isinstance(retrieval, dict) else None
+    logger.info(
+        "memory retrieval agent completed request_id=%s selected_ids=%s needs_full_load=%s "
+        "reason=%r",
+        request_id,
+        list(selected_ids or []),
+        bool(selected_ids),
+        retrieval_reason,
+    )
     if not selected_ids:
+        logger.info(
+            "memory retrieval completed request_id=%s retrieved_count=0 trigger=no_match",
+            request_id,
+        )
         return RETRIEVAL_STATUS_COMPLETED, []
 
     full_items = deps.get_memory_items_by_ids(selected_ids)
     if not isinstance(full_items, list):
         raise TypeError("get_memory_items_by_ids must return a list")
+    logger.info(
+        "memory full load completed request_id=%s selected_ids=%s retrieved_count=%d "
+        "retrieved_ids=%s",
+        request_id,
+        list(selected_ids),
+        len(full_items),
+        _memory_ids(full_items),
+    )
     return RETRIEVAL_STATUS_COMPLETED, list(full_items)
 
 
@@ -396,8 +588,10 @@ def _run_retrieval_in_background(
     compact_history: str,
     recent_history: list[dict],
     user_profile: str,
+    followup_queue: queue.Queue[dict] | None = None,
 ) -> None:
     def _worker() -> None:
+        logger.info("memory retrieval background worker started request_id=%s", request_id)
         try:
             _, retrieved_items = _run_retrieval(
                 deps=deps,
@@ -408,11 +602,48 @@ def _run_retrieval_in_background(
                 user_profile=user_profile,
             )
             request_coordinator.mark_retrieval_completed(request_id, retrieved_items)
+            logger.info(
+                "memory retrieval background worker completed request_id=%s "
+                "retrieved_count=%d retrieved_ids=%s followup_auto_run=true",
+                request_id,
+                len(retrieved_items),
+                _memory_ids(retrieved_items),
+            )
+            followup = _run_followup_decision(deps, request_id)
+            if followup_queue is not None:
+                followup_queue.put({"event": "followup_done", "data": followup})
         except Exception as exc:  # pragma: no cover - defensive background guard
-            request_coordinator.mark_failed(
+            try:
+                request_coordinator.mark_failed(
+                    request_id,
+                    str(exc) or exc.__class__.__name__,
+                )
+            except request_coordinator.RequestNotFoundError:
+                logger.info(
+                    "memory retrieval background worker could not mark failed because "
+                    "request disappeared request_id=%s",
+                    request_id,
+                )
+                if followup_queue is not None:
+                    followup_queue.put(
+                        {
+                            "event": "error",
+                            "data": {"message": f"unknown request_id: {request_id}"},
+                        }
+                    )
+                return
+            logger.error(
+                "memory retrieval background worker failed request_id=%s reason=%r",
                 request_id,
                 str(exc) or exc.__class__.__name__,
             )
+            if followup_queue is not None:
+                followup_queue.put(
+                    {
+                        "event": "error",
+                        "data": {"message": str(exc) or exc.__class__.__name__},
+                    }
+                )
 
     thread = threading.Thread(
         target=_worker,
@@ -420,6 +651,11 @@ def _run_retrieval_in_background(
         daemon=True,
     )
     thread.start()
+    logger.info(
+        "memory retrieval background worker scheduled request_id=%s thread_name=%s",
+        request_id,
+        thread.name,
+    )
 
 
 def _require_reply_text(initial: Any) -> str:
@@ -465,6 +701,10 @@ def _normalize_followup_decision(decision: Any, request_id: str) -> dict:
         "followup_type": followup_type,
         "reply": reply,
     }
+
+
+def _memory_ids(items: list[dict]) -> list[Any]:
+    return [item.get("id") for item in items if isinstance(item, dict)]
 
 
 # ---------------------------------------------------------------------------

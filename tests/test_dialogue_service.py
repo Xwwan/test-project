@@ -219,9 +219,10 @@ class DialogueServiceTest(unittest.TestCase):
         assert response["retrieved_memory_ids"] == []
 
         final_record = request_coordinator.get_request(response["request_id"])
-        assert final_record["status"] == "retrieval_completed"
+        assert final_record["status"] == "no_followup_needed"
         assert final_record["initial_reply"] == "你好，小明！"
         assert final_record["retrieved_items"] == []
+        assert final_record["followup_decision"]["decision"] == "no_followup"
 
         assert initial.last_input is not None
         assert initial.last_input["request_id"] == response["request_id"]
@@ -270,10 +271,11 @@ class DialogueServiceTest(unittest.TestCase):
         request_id = events[-1]["data"]["request_id"]
         _wait_until(
             lambda: request_coordinator.get_request(request_id)["status"]
-            == "retrieval_completed"
+            in {"followup_generated", "no_followup_needed"}
         )
         record = request_coordinator.get_request(request_id)
         assert [item["id"] for item in record["retrieved_items"]] == [2]
+        assert record["followup_decision"]["decision"] == "no_followup"
 
     def test_handle_chat_message_stream_done_does_not_wait_for_retrieval(self) -> None:
         retrieval_started = threading.Event()
@@ -311,14 +313,98 @@ class DialogueServiceTest(unittest.TestCase):
         allow_retrieval_finish.set()
         _wait_until(
             lambda: request_coordinator.get_request(request_id)["status"]
-            == "retrieval_completed"
+            in {"followup_generated", "no_followup_needed"}
         )
         assert retrieval_finished.is_set()
         pending_ids = [
             record["request_id"]
             for record in request_coordinator.get_pending_followup_requests()
         ]
-        assert request_id in pending_ids
+        assert request_id not in pending_ids
+        assert request_coordinator.get_request(request_id)["status"] == "no_followup_needed"
+
+    def test_handle_chat_message_stream_auto_runs_followup_after_background_retrieval(self) -> None:
+        convo = FakeConversationStore()
+        memory = FakeMemoryStore(
+            lightweight=[{"id": 7, "summary": "用户喜欢季羡林", "memory_type": "preference"}]
+        )
+        followup = RecordingFollowupFn(
+            {
+                "decision": "followup",
+                "followup_type": "supplement",
+                "reply": "顺便补充：你之前提过也喜欢季羡林。",
+            }
+        )
+        deps = _build_deps(
+            conversation_store=convo,
+            memory_store=memory,
+            initial_reply_stream_fn=RecordingInitialReplyStreamFn(chunks=["好"]),
+            retrieval_fn=RecordingRetrievalFn(selected_ids=[7]),
+            followup_fn=followup,
+        )
+
+        events = list(handle_chat_message_stream("conv-1", "你认识季羡林吗？", dependencies=deps))
+        request_id = events[-1]["data"]["request_id"]
+
+        _wait_until(
+            lambda: request_coordinator.get_request(request_id)["status"]
+            == "followup_generated"
+        )
+
+        record = request_coordinator.get_request(request_id)
+        assert record["followup_decision"]["decision"] == "followup"
+        assert followup.last_input is not None
+        assert [item["id"] for item in followup.last_input["retrieved_items"]] == [7]
+        assistant_turns = [turn for _, turn in convo.turns if turn["role"] == "assistant"]
+        assert [turn["metadata_json"]["turn_kind"] for turn in assistant_turns] == [
+            "initial",
+            "followup",
+        ]
+        assert request_coordinator.get_pending_followup_requests() == []
+
+    def test_handle_chat_message_stream_can_emit_followup_delta(self) -> None:
+        memory = FakeMemoryStore(
+            lightweight=[{"id": 7, "summary": "用户喜欢季羡林", "memory_type": "preference"}]
+        )
+        followup = RecordingFollowupFn(
+            {
+                "decision": "followup",
+                "followup_type": "supplement",
+                "reply": "顺便补充：你之前提过也喜欢季羡林。",
+            }
+        )
+        deps = _build_deps(
+            memory_store=memory,
+            initial_reply_stream_fn=RecordingInitialReplyStreamFn(chunks=["好"]),
+            retrieval_fn=RecordingRetrievalFn(selected_ids=[7]),
+            followup_fn=followup,
+        )
+
+        events = list(
+            handle_chat_message_stream(
+                "conv-1",
+                "你认识季羡林吗？",
+                dependencies=deps,
+                stream_followup=True,
+            )
+        )
+
+        assert [event["event"] for event in events] == [
+            "meta",
+            "delta",
+            "done",
+            "delta",
+            "followup_done",
+        ]
+        assert events[3]["data"] == {
+            "delta": "顺便补充：你之前提过也喜欢季羡林。",
+            "phase": "followup",
+            "followup_type": "supplement",
+            "request_id": events[-1]["data"]["request_id"],
+            "conversation_id": "conv-1",
+        }
+        assert events[-1]["data"]["decision"] == "followup"
+        assert events[-1]["data"]["reply"] == "顺便补充：你之前提过也喜欢季羡林。"
 
     def test_handle_chat_message_stream_falls_back_to_one_shot_reply(self) -> None:
         deps = _build_deps(initial_reply_fn=RecordingInitialReplyFn(reply="完整回复"))
@@ -347,6 +433,39 @@ class DialogueServiceTest(unittest.TestCase):
         assert retrieval.last_kwargs["current_query"] == "今天可以吃花生酱吗？"
         # The lightweight payload from Person 1 is forwarded to Person 2.
         assert [item["id"] for item in retrieval.last_kwargs["lightweight_memory_items"]] == [1, 2]
+
+    def test_handle_chat_message_auto_runs_followup_decision_after_retrieval(self) -> None:
+        convo = FakeConversationStore()
+        memory = FakeMemoryStore(
+            lightweight=[{"id": 9, "summary": "用户对花生过敏", "memory_type": "constraint"}]
+        )
+        followup = RecordingFollowupFn(
+            {
+                "decision": "followup",
+                "followup_type": "correction",
+                "reply": "提醒一下，你之前告诉我对花生过敏。",
+            }
+        )
+        deps = _build_deps(
+            conversation_store=convo,
+            memory_store=memory,
+            retrieval_fn=RecordingRetrievalFn(selected_ids=[9]),
+            followup_fn=followup,
+        )
+
+        response = handle_chat_message("conv-1", "今天吃花生酱吗？", dependencies=deps)
+
+        record = request_coordinator.get_request(response["request_id"])
+        assert record["status"] == "followup_generated"
+        assert record["followup_decision"]["decision"] == "followup"
+        assert followup.last_input is not None
+        assert [item["id"] for item in followup.last_input["retrieved_items"]] == [9]
+        assistant_turns = [turn for _, turn in convo.turns if turn["role"] == "assistant"]
+        assert [turn["metadata_json"]["turn_kind"] for turn in assistant_turns] == [
+            "initial",
+            "followup",
+        ]
+        assert assistant_turns[-1]["content"] == "提醒一下，你之前告诉我对花生过敏。"
 
 
     def test_handle_chat_message_marks_failed_when_initial_reply_raises(self) -> None:

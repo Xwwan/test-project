@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import base64
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.api.routes import dispatch, iter_voice_latency_finish_stream
+from src.api.routes import (
+    dispatch,
+    iter_voice_latency_finish_stream,
+    iter_voice_live_finish_stream,
+)
 from src.coordinator import request_coordinator
 from src.audio.live_asr import LiveAsrSessionNotFoundError, LiveTranscriptState
 from src.audio.service import AudioDependencies
 from src.audio.schemas import LiveVoiceFinishRequest
+from src.services import DialogueDependencies
 from src.persona import file_manager
 
 
@@ -393,6 +399,237 @@ class VoiceApiRoutesTest(unittest.TestCase):
         )
         assert events[-1]["data"]["reply"] == "语音[emo:angry]回复[act:开心]"
         assert events[-1]["data"]["audio_base64"] is None
+
+    def test_live_voice_finish_stream_uses_injected_dependencies_and_streams_tts(self) -> None:
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="正式语音",
+            is_final=True,
+            error=None,
+        )
+        retrieval_called = threading.Event()
+        retrieved_ids: list[int] = []
+        appended_turns: list[tuple[str, dict]] = []
+        tts = FakeStreamingTts([b"live-audio"])
+
+        def initial_stream(input_data, **kwargs):
+            assert input_data["current_query"] == "正式语音"
+            yield "正式"
+            yield "回复"
+
+        def retrieve(**kwargs):
+            retrieval_called.set()
+            retrieved_ids.extend(item["id"] for item in kwargs["lightweight_memory_items"])
+            return {
+                "request_id": kwargs["request_id"],
+                "selected_memory_ids": [7],
+            }
+
+        deps = DialogueDependencies(
+            read_model_profile=lambda: "model",
+            read_user_profile=lambda: "user",
+            apply_user_profile_patch=lambda patch: "",
+            append_turn=lambda conversation_id, turn: appended_turns.append(
+                (conversation_id, dict(turn))
+            )
+            or turn["turn_id"],
+            get_recent_history=lambda conversation_id, limit=20: [],
+            get_compact_history=lambda conversation_id: "",
+            update_compact_history=lambda conversation_id, value: None,
+            list_lightweight_memory_items=lambda status="active": [
+                {"id": 7, "summary": "真实记忆", "status": "active"}
+            ],
+            get_memory_items_by_ids=lambda ids: [
+                {"id": item_id, "summary": "真实记忆"} for item_id in ids
+            ],
+            apply_memory_operations=lambda operations: [],
+            generate_initial_reply_stream=initial_stream,
+            generate_initial_reply=lambda input_data, **kwargs: {
+                "request_id": input_data["request_id"],
+                "reply": "不应使用",
+            },
+            generate_followup_reply=lambda input_data, **kwargs: {
+                "request_id": input_data["request_id"],
+                "decision": "no_followup",
+                "followup_type": "none",
+                "reply": "",
+            },
+            retrieve_relevant_memory_ids=retrieve,
+            extract_memory_operations=lambda **kwargs: {"operations": []},
+            generate_user_profile_patch=lambda items, current, **kwargs: {
+                "should_update": False,
+                "patch": None,
+                "reason": "fake",
+            },
+        )
+
+        events = list(
+            iter_voice_live_finish_stream(
+                LiveVoiceFinishRequest(
+                    session_id="live-1",
+                    conversation_id="conv-live",
+                    tts_enabled=True,
+                ),
+                dependencies=deps,
+                audio_dependencies=AudioDependencies(tts_client=tts),
+                live_asr_manager=manager,
+            )
+        )
+
+        assert retrieval_called.wait(1.0)
+        assert retrieved_ids == [7]
+        assert [event["event"] for event in events] == [
+            "transcript",
+            "meta",
+            "delta",
+            "delta",
+            "audio",
+            "done",
+            "followup_done",
+        ]
+        assert events[0]["data"]["transcript"] == "正式语音"
+        assert events[2]["data"] == {"delta": "正式"}
+        assert events[3]["data"] == {"delta": "回复"}
+        assert events[4]["data"]["audio_base64"] == base64.b64encode(b"live-audio").decode(
+            "ascii"
+        )
+        assert tts.streamed_text == "正式回复"
+        done = events[-2]["data"]
+        assert done["conversation_id"] == "conv-live"
+        assert done["reply"] == "正式回复"
+        assert done["transcript"] == "正式语音"
+        assert done["audio_base64"] is None
+        assert done["audio_format"] == "pcm"
+        assert done["retrieval_status"] == "pending"
+        assert done["retrieved_memory_ids"] == []
+        assert done["request_id"].startswith("req_")
+        assert done["turn_id"].startswith("turn_")
+        assert events[-1]["data"]["decision"] == "no_followup"
+        assert [turn[1]["role"] for turn in appended_turns] == ["user", "assistant"]
+        assert manager.finished == ["live-1"]
+
+    def test_live_voice_finish_stream_emits_followup_reply_as_delta(self) -> None:
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="你认识季羡林吗",
+            is_final=True,
+            error=None,
+        )
+        appended_turns: list[tuple[str, dict]] = []
+        deps = DialogueDependencies(
+            read_model_profile=lambda: "model",
+            read_user_profile=lambda: "user",
+            apply_user_profile_patch=lambda patch: "",
+            append_turn=lambda conversation_id, turn: appended_turns.append(
+                (conversation_id, dict(turn))
+            )
+            or turn["turn_id"],
+            get_recent_history=lambda conversation_id, limit=20: [],
+            get_compact_history=lambda conversation_id: "",
+            update_compact_history=lambda conversation_id, value: None,
+            list_lightweight_memory_items=lambda status="active": [
+                {"id": 7, "summary": "用户喜欢季羡林", "status": "active"}
+            ],
+            get_memory_items_by_ids=lambda ids: [
+                {"id": item_id, "summary": "用户喜欢季羡林"} for item_id in ids
+            ],
+            apply_memory_operations=lambda operations: [],
+            generate_initial_reply_stream=lambda input_data, **kwargs: iter(["我知道。"]),
+            generate_initial_reply=lambda input_data, **kwargs: {
+                "request_id": input_data["request_id"],
+                "reply": "不应使用",
+            },
+            generate_followup_reply=lambda input_data, **kwargs: {
+                "request_id": input_data["request_id"],
+                "decision": "followup",
+                "followup_type": "supplement",
+                "reply": "顺便补充：你之前提过也喜欢季羡林。",
+            },
+            retrieve_relevant_memory_ids=lambda **kwargs: {
+                "request_id": kwargs["request_id"],
+                "selected_memory_ids": [7],
+                "retrieval_reason": "fake",
+            },
+            extract_memory_operations=lambda **kwargs: {"operations": []},
+            generate_user_profile_patch=lambda items, current, **kwargs: {
+                "should_update": False,
+                "patch": None,
+                "reason": "fake",
+            },
+        )
+
+        events = list(
+            iter_voice_live_finish_stream(
+                LiveVoiceFinishRequest(
+                    session_id="live-1",
+                    conversation_id="conv-live",
+                    tts_enabled=False,
+                ),
+                dependencies=deps,
+                live_asr_manager=manager,
+            )
+        )
+
+        assert [event["event"] for event in events] == [
+            "transcript",
+            "meta",
+            "delta",
+            "done",
+            "delta",
+            "followup_done",
+        ]
+        assert events[2]["data"] == {"delta": "我知道。"}
+        assert events[4]["data"] == {
+            "delta": "顺便补充：你之前提过也喜欢季羡林。",
+            "phase": "followup",
+            "followup_type": "supplement",
+            "request_id": events[-1]["data"]["request_id"],
+            "conversation_id": "conv-live",
+        }
+        assert events[-1]["data"]["decision"] == "followup"
+        assert events[-1]["data"]["reply"] == "顺便补充：你之前提过也喜欢季羡林。"
+        assert [
+            turn[1]["metadata_json"]["turn_kind"]
+            for turn in appended_turns
+            if turn[1]["role"] == "assistant"
+        ] == [
+            "initial",
+            "followup",
+        ]
+
+    def test_voice_latency_finish_stream_does_not_run_memory_retrieval(self) -> None:
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="仍是延迟接口",
+            is_final=True,
+            error=None,
+        )
+
+        def fake_initial_stream(input_data, **kwargs):
+            yield "延迟回复"
+
+        with patch(
+            "src.agents.dialogue_agent.generate_initial_reply_stream",
+            fake_initial_stream,
+        ), patch(
+            "src.agents.memory_retrieval_workflow.retrieve_relevant_memory_ids",
+            side_effect=AssertionError("latency stream must not retrieve memory"),
+        ) as retrieve:
+            events = list(
+                iter_voice_latency_finish_stream(
+                    LiveVoiceFinishRequest(
+                        session_id="live-1",
+                        conversation_id="conv-latency",
+                        tts_enabled=False,
+                    ),
+                    live_asr_manager=manager,
+                )
+            )
+
+        assert retrieve.call_count == 0
+        assert events[-1]["event"] == "done"
+        assert events[-1]["data"]["reply"] == "延迟回复"
+        assert events[-1]["data"]["retrieved_memory_ids"] == []
 
     def test_live_voice_abort_does_not_call_chat(self) -> None:
         manager = FakeLiveAsrManager()

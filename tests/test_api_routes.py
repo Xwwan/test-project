@@ -140,10 +140,16 @@ class ApiRoutesTest(unittest.TestCase):
 
         body = handler.wfile.getvalue().decode("utf-8")
         events = _parse_sse_events(body)
-        assert [event["event"] for event in events] == ["meta", "delta", "done"]
-        assert events[-1]["data"]["reply"] == "你好"
-        assert events[-1]["data"]["retrieval_status"] == "pending"
-        assert events[-1]["data"]["retrieved_memory_ids"] == []
+        assert [event["event"] for event in events] == [
+            "meta",
+            "delta",
+            "done",
+            "followup_done",
+        ]
+        assert events[2]["data"]["reply"] == "你好"
+        assert events[2]["data"]["retrieval_status"] == "pending"
+        assert events[2]["data"]["retrieved_memory_ids"] == []
+        assert events[-1]["data"]["decision"] == "no_followup"
 
     def test_build_app_defaults_to_threading_http_server(self) -> None:
         default = inspect.signature(build_app).parameters["server_class"].default
@@ -171,7 +177,7 @@ class ApiRoutesTest(unittest.TestCase):
         assert "conversation_id" in body["error"]["message"]
 
 
-    def test_get_pending_followups_lists_retrieval_completed_requests(self) -> None:
+    def test_get_pending_followups_is_empty_after_auto_followup_decision(self) -> None:
         memory = FakeMemoryStore(lightweight=[{"id": 1, "summary": "x"}])
         deps, _, _ = _build_dependencies(memory_store=memory, selected_ids=[1])
 
@@ -185,8 +191,10 @@ class ApiRoutesTest(unittest.TestCase):
 
         status, body = dispatch("GET", "/followups/pending", dependencies=deps)
         assert status == 200
-        assert len(body["pending"]) == 1
-        assert body["pending"][0]["request_id"] == chat_body["request_id"]
+        assert body["pending"] == []
+        record = request_coordinator.get_request(chat_body["request_id"])
+        assert record["status"] == "no_followup_needed"
+        assert record["followup_decision"]["decision"] == "no_followup"
 
 
     def test_followup_run_returns_decision_and_clears_pending(self) -> None:
