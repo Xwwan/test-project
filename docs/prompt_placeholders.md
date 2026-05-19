@@ -5,6 +5,7 @@ Prompt 内容不属于 Person 1 的职责范围。本文档只记录 Person 2 �
 
 ```text
 prompts/dialogue_agent.md
+prompts/dialogue_followup_decision.md
 prompts/memory_retrieval_workflow.md
 prompts/memory_curator.md
 prompts/profile_consolidator.md

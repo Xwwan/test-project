@@ -59,6 +59,12 @@ routes:
       response_format:
         type: json_object
 
+dialogue:
+  followup:
+    # Number of latest/newer conversation turns sent to the follow-up decision prompt.
+    # Use -1 to include all available context.
+    context_window_turns: 50
+
 reply_tags:
   emo:
     - angry
