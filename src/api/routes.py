@@ -24,7 +24,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from src.coordinator import RequestNotFoundError, RequestStateError, get_pending_followup_requests
 from src.audio.live_asr import (
@@ -440,6 +440,18 @@ def _error(status: int, message: str) -> JSONResponse:
     return status, {"error": {"message": message}}
 
 
+def _query_bool(query: dict[str, list[str]], key: str, default: bool) -> bool:
+    values = query.get(key)
+    if not values:
+        return default
+    value = values[-1].strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{key} must be a boolean")
+
+
 def _handle_latency_chat_message(
     conversation_id: str,
     message: str,
@@ -680,6 +692,7 @@ def _iter_tts_audio_events(
     text: str,
     *,
     audio_dependencies: AudioDependencies | None = None,
+    extra_data: dict | None = None,
 ):
     tts_text = prepare_tts_text(text)
     if not tts_text.strip():
@@ -699,14 +712,18 @@ def _iter_tts_audio_events(
     for index, chunk in enumerate(chunks):
         if not chunk:
             continue
-        yield {
-            "event": "audio",
-            "data": {
+        data = dict(extra_data or {})
+        data.update(
+            {
                 "audio_base64": base64.b64encode(chunk).decode("ascii"),
                 "audio_format": "pcm",
                 "sample_rate": sample_rate,
                 "chunk_index": index,
-            },
+            }
+        )
+        yield {
+            "event": "audio",
+            "data": data,
         }
 
 
@@ -811,10 +828,13 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             )
 
     def _write_followups_stream(self) -> None:
-        from urllib.parse import parse_qs
-
         query = parse_qs(urlsplit(self.path).query)
         conversation_id = (query.get("conversation_id") or [""])[0]
+        try:
+            tts_enabled = _query_bool(query, "tts_enabled", False)
+        except ValueError as exc:
+            self._write_json(400, {"error": {"message": str(exc)}})
+            return
         if not conversation_id:
             self._write_json(
                 400,
@@ -831,6 +851,35 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         try:
             for item in iter_followup_events(conversation_id):
                 self._write_sse_event(item.get("event", "message"), item.get("data", {}))
+                if item.get("event") != "followup" or not tts_enabled:
+                    continue
+                payload = item.get("data", {})
+                reply = payload.get("reply")
+                if not isinstance(reply, str) or not reply.strip():
+                    continue
+                audio_event_base = {
+                    "conversation_id": payload.get("conversation_id", conversation_id),
+                    "request_id": payload.get("request_id", ""),
+                    "followup_turn_id": payload.get("followup_turn_id", ""),
+                    "phase": "followup",
+                }
+                for audio_event in _iter_tts_audio_events(
+                    reply,
+                    audio_dependencies=type(self).injected_audio_dependencies,
+                    extra_data=audio_event_base,
+                ):
+                    self._write_sse_event(
+                        audio_event.get("event", "message"),
+                        audio_event.get("data", {}),
+                    )
+                done_data = dict(audio_event_base)
+                done_data.update(
+                    {
+                        "audio_base64": None,
+                        "audio_format": "pcm",
+                    }
+                )
+                self._write_sse_event("followup_done", done_data)
         except (BrokenPipeError, ConnectionResetError):  # pragma: no cover - network path
             logger.info(
                 "followup stream client disconnected conversation_id=%s",

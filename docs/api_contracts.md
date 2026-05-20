@@ -21,6 +21,7 @@
 | `POST` | `/voice/live/abort` | 中止实时语音识别会话，不生成回复 |
 | `POST` | `/tools/voice-latency/finish-stream` | 结束实时语音识别会话，并以 SSE 流式返回延迟测试回复 |
 | `GET`  | `/followups/pending` | 列出等待 followup 决策的请求 |
+| `GET`  | `/followups/stream` | 订阅某个 conversation 的二次回复事件和可选语音流 |
 | `POST` | `/followups/{request_id}/run` | 触发某个请求的二次回复判断 |
 | `POST` | `/memory/curate` | 对一段对话运行 Memory Curator 并落库 |
 | `POST` | `/memory/profile/refresh` | 运行 Profile Consolidator 并按需更新 `User.md` |
@@ -365,7 +366,46 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 
 ---
 
-## 7. `POST /followups/{request_id}/run`
+## 7. `GET /followups/stream?conversation_id=...`
+
+请求 query：
+
+```text
+conversation_id=string
+tts_enabled=false
+```
+
+响应为 `text/event-stream; charset=utf-8`。默认 `tts_enabled=false`，只发送文本
+二次回复事件：
+
+```text
+event: followup
+data: {"conversation_id":"string","request_id":"req_xxx","parent_user_turn_id":"turn_xxx","parent_initial_reply_turn_id":"turn_xxx","followup_turn_id":"turn_xxx","original_user_query":"原始问题","initial_reply":"首条回复","followup_type":"supplement","reply":"二次回复文本"}
+```
+
+当 `tts_enabled=true` 时，每条 `followup` 之后会继续发送该二次回复的 TTS 音频：
+
+```text
+event: audio
+data: {"conversation_id":"string","request_id":"req_xxx","followup_turn_id":"turn_xxx","phase":"followup","audio_base64":"base64 encoded 24kHz 16-bit mono PCM chunk","audio_format":"pcm","sample_rate":24000,"chunk_index":0}
+
+event: followup_done
+data: {"conversation_id":"string","request_id":"req_xxx","followup_turn_id":"turn_xxx","phase":"followup","audio_base64":null,"audio_format":"pcm"}
+```
+
+约定：
+
+- `conversation_id` 必填，缺失时返回 `400`。
+- `tts_enabled` 可为 `true/false`、`1/0`、`yes/no` 或 `on/off`。
+- `audio` 事件只为 `followup.reply` 非空且经 reply tag 过滤后仍有可读文本的回复生成。
+- TTS 文本会先经过 reply tag 过滤，`[emo:...]` / `[act:...]` 不会进入语音。
+- `followup_done` 表示当前二次回复的语音分片已发送完毕；纯文本模式不会发送
+  `followup_done`。
+- 连接空闲时服务端可能发送 `ping` keepalive 事件。
+
+---
+
+## 8. `POST /followups/{request_id}/run`
 
 请求体可省略或为 `{}`。
 
@@ -390,7 +430,7 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 
 ---
 
-## 8. `POST /memory/curate`
+## 9. `POST /memory/curate`
 
 请求：
 
@@ -421,11 +461,11 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 
 - `operations` 即 Memory Curator 调用 LLM 后归一化得到的列表；为空时
   `applied` 也为空。
-- `payload` 字段集合见下方第 9 节。
+- `payload` 字段集合见下方第 10 节。
 
 ---
 
-## 9. Memory Curator 输出 schema
+## 10. Memory Curator 输出 schema
 
 参考 `docs/tasks/person-3-orchestration-curator.md` 第 5.3 节。Person 3
 归一化后保证：
@@ -462,7 +502,7 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 
 ---
 
-## 10. `POST /memory/profile/refresh`
+## 11. `POST /memory/profile/refresh`
 
 请求体为空 `{}`。
 
@@ -490,7 +530,7 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 
 ---
 
-## 11. Request Coordinator 内部状态机
+## 12. Request Coordinator 内部状态机
 
 ```
 received
@@ -506,7 +546,7 @@ failed                          (任意阶段失败)
 
 ---
 
-## 12. Dialogue Service 对 Person 1 / Person 2 的依赖
+## 13. Dialogue Service 对 Person 1 / Person 2 的依赖
 
 所有依赖通过 `DialogueDependencies` 注入，包括但不限于：
 

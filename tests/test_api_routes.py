@@ -6,14 +6,17 @@ A single fake dependency container drives the underlying dialogue service.
 
 from __future__ import annotations
 
+import base64
+import inspect
 import io
 import json
-import inspect
 from http.server import ThreadingHTTPServer
 from typing import Any
 
 import unittest
+from unittest.mock import patch
 
+from src.audio.service import AudioDependencies
 from src.api.routes import ChatRequestHandler, build_app, dispatch
 from src.coordinator import request_coordinator
 from src.services import DialogueDependencies, reset_followup_delivery_bus
@@ -150,6 +153,86 @@ class ApiRoutesTest(unittest.TestCase):
         assert events[2]["data"]["reply"] == "你好"
         assert events[2]["data"]["retrieval_status"] == "pending"
         assert events[2]["data"]["retrieved_memory_ids"] == []
+
+    def test_followups_stream_yields_audio_when_tts_enabled(self) -> None:
+        deps, _, _ = _build_dependencies()
+        tts = FakeStreamingTts([b"audio-a", b"audio-b"])
+        handler = _FakeStreamHandler(
+            deps,
+            audio_dependencies=AudioDependencies(tts_client=tts),
+            path="/followups/stream?conversation_id=conv-1&tts_enabled=true",
+        )
+        followup_payload = {
+            "conversation_id": "conv-1",
+            "request_id": "req-1",
+            "followup_turn_id": "turn-followup",
+            "reply": "补充[emo:happy]一下[act:wave]。",
+        }
+
+        with patch(
+            "src.api.routes.iter_followup_events",
+            lambda conversation_id: iter(
+                [{"event": "followup", "data": followup_payload}]
+            ),
+        ):
+            ChatRequestHandler._write_followups_stream(handler)
+
+        body = handler.wfile.getvalue().decode("utf-8")
+        events = _parse_sse_events(body)
+        assert [event["event"] for event in events] == [
+            "followup",
+            "audio",
+            "audio",
+            "followup_done",
+        ]
+        assert tts.streamed_text == "补充一下。"
+        assert events[1]["data"]["request_id"] == "req-1"
+        assert events[1]["data"]["followup_turn_id"] == "turn-followup"
+        assert events[1]["data"]["phase"] == "followup"
+        assert events[1]["data"]["audio_base64"] == base64.b64encode(b"audio-a").decode(
+            "ascii"
+        )
+        assert events[2]["data"]["audio_base64"] == base64.b64encode(b"audio-b").decode(
+            "ascii"
+        )
+        assert events[3]["data"] == {
+            "conversation_id": "conv-1",
+            "request_id": "req-1",
+            "followup_turn_id": "turn-followup",
+            "phase": "followup",
+            "audio_base64": None,
+            "audio_format": "pcm",
+        }
+
+    def test_followups_stream_keeps_text_only_default(self) -> None:
+        deps, _, _ = _build_dependencies()
+        tts = FakeStreamingTts([b"audio"])
+        handler = _FakeStreamHandler(
+            deps,
+            audio_dependencies=AudioDependencies(tts_client=tts),
+            path="/followups/stream?conversation_id=conv-1",
+        )
+
+        with patch(
+            "src.api.routes.iter_followup_events",
+            lambda conversation_id: iter(
+                [
+                    {
+                        "event": "followup",
+                        "data": {
+                            "conversation_id": "conv-1",
+                            "request_id": "req-1",
+                            "reply": "只发文本",
+                        },
+                    }
+                ]
+            ),
+        ):
+            ChatRequestHandler._write_followups_stream(handler)
+
+        events = _parse_sse_events(handler.wfile.getvalue().decode("utf-8"))
+        assert [event["event"] for event in events] == ["followup"]
+        assert tts.streamed_text is None
 
     def test_build_app_defaults_to_threading_http_server(self) -> None:
         default = inspect.signature(build_app).parameters["server_class"].default
@@ -312,8 +395,16 @@ def _parse_sse_events(payload: str) -> list[dict[str, Any]]:
 class _FakeStreamHandler:
     _write_sse_event = ChatRequestHandler._write_sse_event
 
-    def __init__(self, dependencies: DialogueDependencies) -> None:
+    def __init__(
+        self,
+        dependencies: DialogueDependencies,
+        *,
+        audio_dependencies: AudioDependencies | None = None,
+        path: str = "/chat/stream",
+    ) -> None:
         type(self).injected_dependencies = dependencies
+        type(self).injected_audio_dependencies = audio_dependencies
+        self.path = path
         self.status: int | None = None
         self.headers: list[tuple[str, str]] = []
         self.wfile = io.BytesIO()
@@ -330,3 +421,18 @@ class _FakeStreamHandler:
     def _write_json(self, status: int, body: dict) -> None:
         self.status = status
         self.wfile.write(json.dumps(body).encode("utf-8"))
+
+
+class FakeStreamingTts:
+    sample_rate = 24000
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = list(chunks)
+        self.streamed_text: str | None = None
+
+    def synthesize(self, text: str) -> bytes:
+        return b"".join(self.synthesize_stream(text))
+
+    def synthesize_stream(self, text: str):
+        self.streamed_text = text
+        yield from self.chunks
