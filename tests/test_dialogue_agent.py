@@ -163,7 +163,7 @@ class DialogueAgentTest(unittest.TestCase):
         self.assertIn("不确定", result["reply"])
         self.assertIn("专业", result["reply"])
 
-    def test_high_risk_followup_logs_trigger_reason(self):
+    def test_high_risk_followup_logs_tag_trigger_reason(self):
         client = JsonClient(
             {
                 "decision": "followup",
@@ -173,16 +173,59 @@ class DialogueAgentTest(unittest.TestCase):
         )
 
         input_data = _followup_input()
-        input_data["retrieved_items"][0]["memory_type"] = "legal"
+        input_data["retrieved_items"][0]["tags_json"] = ["legal", "contract"]
 
         with self.assertLogs("chat-service.agents.dialogue", level="INFO") as logs:
             result = generate_followup_reply(input_data, model_client=client)
 
         self.assertEqual(result["decision"], "followup")
         log_text = "\n".join(logs.output)
-        self.assertIn("source=retrieved_item_memory_type", log_text)
+        self.assertIn("source=retrieved_item_tag", log_text)
         self.assertIn("item_id=1", log_text)
-        self.assertIn("memory_type=legal", log_text)
+        self.assertIn("tag=legal", log_text)
+
+    def test_high_risk_followup_logs_domain_trigger_reason(self):
+        client = JsonClient(
+            {
+                "decision": "followup",
+                "followup_type": "supplement",
+                "reply": "这个信息和之前的财务偏好有关。",
+            }
+        )
+
+        input_data = _followup_input()
+        input_data["retrieved_items"][0]["metadata_json"] = {"domain": "financial"}
+
+        with self.assertLogs("chat-service.agents.dialogue", level="INFO") as logs:
+            result = generate_followup_reply(input_data, model_client=client)
+
+        self.assertEqual(result["decision"], "followup")
+        log_text = "\n".join(logs.output)
+        self.assertIn("source=retrieved_item_domain", log_text)
+        self.assertIn("item_id=1", log_text)
+        self.assertIn("domain=financial", log_text)
+
+    def test_memory_type_domain_value_does_not_trigger_high_risk(self):
+        client = JsonClient(
+            {
+                "decision": "followup",
+                "followup_type": "supplement",
+                "reply": "补充一点：这是普通记忆补充。",
+            }
+        )
+
+        input_data = _followup_input()
+        input_data["retrieved_items"][0]["memory_type"] = "financial"
+        input_data["retrieved_items"][0]["sensitivity"] = "normal"
+        input_data["retrieved_items"][0]["tags_json"] = []
+        input_data["retrieved_items"][0]["metadata_json"] = {}
+
+        result = generate_followup_reply(input_data, model_client=client)
+
+        self.assertEqual(result["decision"], "followup")
+        self.assertEqual(result["reply"], "补充一点：这是普通记忆补充。")
+        self.assertNotIn("不确定", result["reply"])
+        self.assertNotIn("专业", result["reply"])
 
 
 def _followup_input():

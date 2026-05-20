@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -52,6 +53,34 @@ HIGH_RISK_QUERY_KEYWORDS = {
 }
 
 HIGH_RISK_SENSITIVITY = {"sensitive", "high", "high_risk"}
+
+HIGH_RISK_MEMORY_DOMAINS = {
+    "health",
+    "medical",
+    "medicine",
+    "legal",
+    "law",
+    "finance",
+    "financial",
+    "investment",
+    "stock",
+    "fund",
+    "tax",
+    "loan",
+    "insurance",
+    "健康",
+    "医疗",
+    "用药",
+    "法律",
+    "财务",
+    "金融",
+    "投资",
+    "股票",
+    "基金",
+    "税",
+    "贷款",
+    "保险",
+}
 
 
 def generate_initial_reply(
@@ -338,18 +367,56 @@ def _is_high_risk(input_data: dict) -> bool:
                 sensitivity,
             )
             return True
-        memory_type = str(item.get("memory_type", "")).lower()
-        if memory_type in {"medical", "legal", "financial"}:
+
+        for tag in _memory_item_tags(item):
+            if tag in HIGH_RISK_MEMORY_DOMAINS:
+                logger.info(
+                    "high risk followup triggered request_id=%s "
+                    "source=retrieved_item_tag item_index=%d item_id=%s tag=%s",
+                    request_id,
+                    index,
+                    item_id,
+                    tag,
+                )
+                return True
+
+        domain = _memory_item_domain(item)
+        if domain in HIGH_RISK_MEMORY_DOMAINS:
             logger.info(
                 "high risk followup triggered request_id=%s "
-                "source=retrieved_item_memory_type item_index=%d item_id=%s memory_type=%s",
+                "source=retrieved_item_domain item_index=%d item_id=%s domain=%s",
                 request_id,
                 index,
                 item_id,
-                memory_type,
+                domain,
             )
             return True
     return False
+
+
+def _memory_item_tags(item: dict) -> list[str]:
+    tags = item.get("tags_json", [])
+    if isinstance(tags, str):
+        try:
+            parsed = json.loads(tags)
+        except json.JSONDecodeError:
+            parsed = [tags]
+        tags = parsed
+    if not isinstance(tags, (list, tuple, set)):
+        return []
+    return [str(tag).strip().lower() for tag in tags if str(tag).strip()]
+
+
+def _memory_item_domain(item: dict) -> str:
+    metadata = item.get("metadata_json", {})
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            return ""
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("domain", "")).strip().lower()
 
 
 def _ensure_high_risk_caveat(reply: str) -> str:
