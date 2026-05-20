@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from src.agents._prompting import (
@@ -13,6 +14,9 @@ from src.agents._prompting import (
     section,
 )
 from src.models import ChatMessage, ModelClient, chat_once, chat_stream
+
+
+logger = logging.getLogger("chat-service.agents.dialogue")
 
 
 DEFAULT_DIALOGUE_PROMPT = """You are the Dialogue Agent.
@@ -308,18 +312,42 @@ def _normalize_followup_payload(payload: dict) -> dict:
 
 
 def _is_high_risk(input_data: dict) -> bool:
+    request_id = str(input_data.get("request_id", ""))
     query = str(input_data.get("original_user_query", ""))
-    if any(keyword in query for keyword in HIGH_RISK_QUERY_KEYWORDS):
-        return True
+    for keyword in HIGH_RISK_QUERY_KEYWORDS:
+        if keyword in query:
+            logger.info(
+                "high risk followup triggered request_id=%s source=query_keyword keyword=%s",
+                request_id,
+                keyword,
+            )
+            return True
 
-    for item in input_data.get("retrieved_items", []):
+    for index, item in enumerate(input_data.get("retrieved_items", [])):
         if not isinstance(item, dict):
             continue
+        item_id = item.get("id", "")
         sensitivity = str(item.get("sensitivity", "")).lower()
         if sensitivity in HIGH_RISK_SENSITIVITY:
+            logger.info(
+                "high risk followup triggered request_id=%s "
+                "source=retrieved_item_sensitivity item_index=%d item_id=%s sensitivity=%s",
+                request_id,
+                index,
+                item_id,
+                sensitivity,
+            )
             return True
         memory_type = str(item.get("memory_type", "")).lower()
         if memory_type in {"medical", "legal", "financial"}:
+            logger.info(
+                "high risk followup triggered request_id=%s "
+                "source=retrieved_item_memory_type item_index=%d item_id=%s memory_type=%s",
+                request_id,
+                index,
+                item_id,
+                memory_type,
+            )
             return True
     return False
 

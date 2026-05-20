@@ -18,10 +18,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import queue
 import re
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
 from src.coordinator import RequestNotFoundError, RequestStateError, get_pending_followup_requests
@@ -74,6 +76,10 @@ logger = logging.getLogger("chat-service.api")
 _FOLLOWUP_RUN_PATTERN = re.compile(r"^/followups/(?P<request_id>[^/]+)/run$")
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _VOICE_LATENCY_PAGE = _STATIC_DIR / "voice_latency.html"
+_TTS_SENTINEL = object()
+_STREAM_SENTINEL = object()
+_TTS_SEGMENT_PUNCTUATION = "。！？!?；;\n"
+_TTS_SEGMENT_MAX_CHARS = 80
 
 
 def dispatch(
@@ -303,32 +309,16 @@ def iter_voice_latency_finish_stream(
         },
     }
 
-    done_event: dict | None = None
-    for item in handle_chat_message_stream(
-        request.conversation_id,
-        transcript,
-        dependencies=_build_no_db_latency_dependencies(),
-    ):
-        if item.get("event") == "done":
-            data = dict(item.get("data", {}))
-            data["transcript"] = transcript
-            data["audio_base64"] = None
-            data["audio_format"] = "pcm"
-            done_event = {"event": "done", "data": data}
-            continue
-        yield item
-
-    if done_event is None:
-        return
-
-    if request.tts_enabled:
-        reply = done_event["data"].get("reply") or ""
-        yield from _iter_tts_audio_events(
-            reply,
-            audio_dependencies=audio_dependencies,
-        )
-
-    yield done_event
+    yield from _iter_voice_reply_stream_events(
+        lambda: handle_chat_message_stream(
+            request.conversation_id,
+            transcript,
+            dependencies=_build_no_db_latency_dependencies(),
+        ),
+        transcript=transcript,
+        tts_enabled=request.tts_enabled,
+        audio_dependencies=audio_dependencies,
+    )
 
 
 def iter_voice_live_finish_stream(
@@ -357,30 +347,16 @@ def iter_voice_live_finish_stream(
         },
     }
 
-    done_sent = False
-    for item in handle_chat_message_stream(
-        request.conversation_id,
-        transcript,
-        dependencies=dependencies,
-    ):
-        if item.get("event") == "done":
-            data = dict(item.get("data", {}))
-            data["transcript"] = transcript
-            data["audio_base64"] = None
-            data["audio_format"] = "pcm"
-            if request.tts_enabled:
-                reply = data.get("reply") or ""
-                yield from _iter_tts_audio_events(
-                    reply,
-                    audio_dependencies=audio_dependencies,
-                )
-            yield {"event": "done", "data": data}
-            done_sent = True
-            continue
-        yield item
-
-    if not done_sent:
-        return
+    yield from _iter_voice_reply_stream_events(
+        lambda: handle_chat_message_stream(
+            request.conversation_id,
+            transcript,
+            dependencies=dependencies,
+        ),
+        transcript=transcript,
+        tts_enabled=request.tts_enabled,
+        audio_dependencies=audio_dependencies,
+    )
 
 
 def _post_voice_live_abort(
@@ -515,6 +491,189 @@ def _build_no_db_latency_dependencies() -> DialogueDependencies:
             "reason": "latency probe",
         },
     )
+
+
+class _StreamWorkerError:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+
+def _iter_voice_reply_stream_events(
+    chat_events_factory: Callable[[], Iterable[dict]],
+    *,
+    transcript: str,
+    tts_enabled: bool,
+    audio_dependencies: AudioDependencies | None = None,
+):
+    if not tts_enabled:
+        for item in chat_events_factory():
+            if item.get("event") == "done":
+                yield _voice_done_event(item, transcript)
+                continue
+            yield item
+        return
+
+    output_queue: queue.Queue[Any] = queue.Queue()
+    tts_queue: queue.Queue[Any] = queue.Queue()
+    done_holder: dict[str, dict] = {}
+
+    def enqueue_tts_segment(raw_text: str) -> None:
+        tts_text = prepare_tts_text(raw_text)
+        if tts_text.strip():
+            tts_queue.put(tts_text)
+
+    def chat_worker() -> None:
+        segmenter = _StreamingTtsSegmenter()
+        try:
+            for item in chat_events_factory():
+                if item.get("event") == "delta":
+                    output_queue.put(item)
+                    delta = item.get("data", {}).get("delta")
+                    if isinstance(delta, str) and delta:
+                        for segment in segmenter.feed(delta):
+                            enqueue_tts_segment(segment)
+                    continue
+
+                if item.get("event") == "done":
+                    for segment in segmenter.flush():
+                        enqueue_tts_segment(segment)
+                    done_holder["event"] = _voice_done_event(item, transcript)
+                    tts_queue.put(_TTS_SENTINEL)
+                    return
+
+                output_queue.put(item)
+            tts_queue.put(_TTS_SENTINEL)
+        except BaseException as exc:  # pragma: no cover - defensive stream path
+            output_queue.put(_StreamWorkerError(exc))
+            tts_queue.put(_TTS_SENTINEL)
+
+    def tts_worker() -> None:
+        try:
+            audio_deps = audio_dependencies or AudioDependencies()
+            tts_client = audio_deps.tts_client
+            stream_fn: Callable[[str], Iterable[bytes]] | None = None
+            sample_rate = 24000
+            chunk_index = 0
+            segment_index = 0
+
+            while True:
+                segment = tts_queue.get()
+                if segment is _TTS_SENTINEL:
+                    done_event = done_holder.get("event")
+                    if done_event is not None:
+                        output_queue.put(done_event)
+                    output_queue.put(_STREAM_SENTINEL)
+                    return
+
+                if tts_client is None:
+                    from src.audio.tts import build_default_tts_client
+
+                    tts_client = build_default_tts_client()
+                    sample_rate = getattr(tts_client, "sample_rate", 24000)
+                    candidate_stream_fn = getattr(tts_client, "synthesize_stream", None)
+                    if callable(candidate_stream_fn):
+                        stream_fn = candidate_stream_fn
+                elif stream_fn is None:
+                    sample_rate = getattr(tts_client, "sample_rate", 24000)
+                    candidate_stream_fn = getattr(tts_client, "synthesize_stream", None)
+                    if callable(candidate_stream_fn):
+                        stream_fn = candidate_stream_fn
+
+                if callable(stream_fn):
+                    chunks = stream_fn(segment)
+                else:
+                    chunks = [tts_client.synthesize(segment)]
+
+                for chunk in chunks:
+                    if not chunk:
+                        continue
+                    output_queue.put(
+                        {
+                            "event": "audio",
+                            "data": {
+                                "audio_base64": base64.b64encode(chunk).decode("ascii"),
+                                "audio_format": "pcm",
+                                "sample_rate": sample_rate,
+                                "chunk_index": chunk_index,
+                                "segment_index": segment_index,
+                            },
+                        }
+                    )
+                    chunk_index += 1
+                segment_index += 1
+        except BaseException as exc:  # pragma: no cover - defensive stream path
+            output_queue.put(_StreamWorkerError(exc))
+            output_queue.put(_STREAM_SENTINEL)
+
+    threads = [
+        threading.Thread(target=tts_worker, name="voice-stream-tts", daemon=True),
+        threading.Thread(target=chat_worker, name="voice-stream-chat", daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    try:
+        while True:
+            item = output_queue.get()
+            if item is _STREAM_SENTINEL:
+                return
+            if isinstance(item, _StreamWorkerError):
+                raise item.error
+            yield item
+    finally:
+        tts_queue.put(_TTS_SENTINEL)
+
+
+def _voice_done_event(item: dict, transcript: str) -> dict:
+    data = dict(item.get("data", {}))
+    data["transcript"] = transcript
+    data["audio_base64"] = None
+    data["audio_format"] = "pcm"
+    return {"event": "done", "data": data}
+
+
+class _StreamingTtsSegmenter:
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    def feed(self, delta: str) -> list[str]:
+        self._buffer += delta
+        return self._pop_ready_segments()
+
+    def flush(self) -> list[str]:
+        if not self._buffer.strip():
+            self._buffer = ""
+            return []
+        segment = self._buffer
+        self._buffer = ""
+        return [segment]
+
+    def _pop_ready_segments(self) -> list[str]:
+        segments: list[str] = []
+        while True:
+            split_at = self._find_punctuation_split()
+            if split_at is None and self._can_split_by_length():
+                split_at = len(self._buffer)
+            if split_at is None:
+                return segments
+
+            segment = self._buffer[:split_at]
+            self._buffer = self._buffer[split_at:]
+            if segment.strip():
+                segments.append(segment)
+
+    def _find_punctuation_split(self) -> int | None:
+        for index, char in enumerate(self._buffer):
+            if char in _TTS_SEGMENT_PUNCTUATION:
+                return index + 1
+        return None
+
+    def _can_split_by_length(self) -> bool:
+        if len(self._buffer) < _TTS_SEGMENT_MAX_CHARS:
+            return False
+        last_open = self._buffer.rfind("[")
+        last_close = self._buffer.rfind("]")
+        return last_open <= last_close
 
 
 def _iter_tts_audio_events(

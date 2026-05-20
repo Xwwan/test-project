@@ -402,6 +402,61 @@ class VoiceApiRoutesTest(unittest.TestCase):
         assert events[-1]["data"]["reply"] == "语音[emo:angry]回复[act:开心]"
         assert events[-1]["data"]["audio_base64"] is None
 
+    def test_voice_latency_finish_stream_starts_tts_before_text_done(self) -> None:
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="需要更早出声",
+            is_final=True,
+            error=None,
+        )
+        first_audio_queued = threading.Event()
+        tts_calls: list[str] = []
+
+        class EarlyStreamingTts:
+            sample_rate = 24000
+
+            def synthesize_stream(self, text: str):
+                tts_calls.append(text)
+                chunk = f"audio-{len(tts_calls)}".encode("ascii")
+                yield chunk
+                if len(tts_calls) == 1:
+                    first_audio_queued.set()
+
+        def fake_initial_stream(input_data, **kwargs):
+            yield "第一句。[emo:angry]"
+            assert first_audio_queued.wait(1.0)
+            yield "第二句[act:开心]"
+
+        with patch(
+            "src.agents.dialogue_agent.generate_initial_reply_stream",
+            fake_initial_stream,
+        ):
+            events = list(
+                iter_voice_latency_finish_stream(
+                    LiveVoiceFinishRequest(
+                        session_id="live-1",
+                        conversation_id="conv-latency",
+                        tts_enabled=True,
+                    ),
+                    audio_dependencies=AudioDependencies(tts_client=EarlyStreamingTts()),
+                    live_asr_manager=manager,
+                )
+            )
+
+        assert [event["event"] for event in events] == [
+            "transcript",
+            "meta",
+            "delta",
+            "audio",
+            "delta",
+            "audio",
+            "done",
+        ]
+        assert tts_calls == ["第一句。", "第二句"]
+        assert events[3]["data"]["segment_index"] == 0
+        assert events[5]["data"]["segment_index"] == 1
+        assert events[-1]["data"]["reply"] == "第一句。[emo:angry]第二句[act:开心]"
+
     def test_live_voice_finish_stream_uses_injected_dependencies_and_streams_tts(self) -> None:
         manager = FakeLiveAsrManager()
         manager.states["live-1"] = LiveTranscriptState(

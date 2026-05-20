@@ -323,7 +323,7 @@ event: delta
 data: {"delta":"回复片段"}
 
 event: audio
-data: {"audio_base64":"base64 encoded 24kHz 16-bit mono PCM chunk","audio_format":"pcm","sample_rate":24000,"chunk_index":0}
+data: {"audio_base64":"base64 encoded 24kHz 16-bit mono PCM chunk","audio_format":"pcm","sample_rate":24000,"chunk_index":0,"segment_index":0}
 
 event: done
 data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"voice-latency-demo","reply":"完整回复","retrieval_status":"pending","retrieved_memory_ids":[],"transcript":"最终识别文本","audio_base64":null,"audio_format":"pcm"}
@@ -333,8 +333,15 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 
 - 页面用第一个 `delta` 到达时间统计模型首响应延迟，并继续读取流直到 `done`。
 - 该接口使用 no-op conversation/history/memory 依赖，不写入本地 SQLite 数据库。
-- 当 `tts_enabled=true` 时，服务端会在完整回复生成后以一个或多个 `audio`
-  事件流式返回 TTS PCM chunk；`done.audio_base64` 仍为 `null`，避免重复返回完整音频。
+- 当 `tts_enabled=true` 时，服务端会把模型 `delta` 按句切分并并发提交给
+  TTS。`audio` 事件可能在完整回复生成前到达，也可能与后续 `delta` 交错
+  到达；前端应按 `audio` 事件到达顺序排队播放。
+- TTS 文本仍会先经过 reply tag 过滤，`[emo:...]` / `[act:...]` 不会进入语音
+  合成文本。
+- `audio.chunk_index` 是整次响应内的音频 chunk 序号，`audio.segment_index` 是
+  本次回复内的 TTS 文本片段序号。
+- `done` 在文本流和最后一个 TTS 片段都发送完成后返回；`done.audio_base64`
+  仍为 `null`，避免重复返回完整音频。
 - 当 `tts_enabled=false` 时，不发送 `audio` 事件。
 
 ---

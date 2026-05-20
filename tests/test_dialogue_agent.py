@@ -163,6 +163,27 @@ class DialogueAgentTest(unittest.TestCase):
         self.assertIn("不确定", result["reply"])
         self.assertIn("专业", result["reply"])
 
+    def test_high_risk_followup_logs_trigger_reason(self):
+        client = JsonClient(
+            {
+                "decision": "followup",
+                "followup_type": "supplement",
+                "reply": "这个合同条款要按之前的信息处理。",
+            }
+        )
+
+        input_data = _followup_input()
+        input_data["retrieved_items"][0]["memory_type"] = "legal"
+
+        with self.assertLogs("chat-service.agents.dialogue", level="INFO") as logs:
+            result = generate_followup_reply(input_data, model_client=client)
+
+        self.assertEqual(result["decision"], "followup")
+        log_text = "\n".join(logs.output)
+        self.assertIn("source=retrieved_item_memory_type", log_text)
+        self.assertIn("item_id=1", log_text)
+        self.assertIn("memory_type=legal", log_text)
+
 
 def _followup_input():
     return {
