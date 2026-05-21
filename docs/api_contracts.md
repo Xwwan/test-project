@@ -324,7 +324,7 @@ event: delta
 data: {"delta":"回复片段"}
 
 event: audio
-data: {"audio_base64":"base64 encoded 24kHz 16-bit mono PCM chunk","audio_format":"pcm","sample_rate":24000,"chunk_index":0,"segment_index":0}
+data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"voice-latency-demo","phase":"initial","audio_base64":"base64 encoded 24kHz 16-bit mono PCM chunk","audio_format":"pcm","sample_rate":24000,"chunk_index":0,"segment_index":0}
 
 event: done
 data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"voice-latency-demo","reply":"完整回复","retrieval_status":"pending","retrieved_memory_ids":[],"transcript":"最终识别文本","audio_base64":null,"audio_format":"pcm"}
@@ -336,11 +336,17 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 - 该接口使用 no-op conversation/history/memory 依赖，不写入本地 SQLite 数据库。
 - 当 `tts_enabled=true` 时，服务端会把模型 `delta` 按句切分并并发提交给
   TTS。`audio` 事件可能在完整回复生成前到达，也可能与后续 `delta` 交错
-  到达；前端应按 `audio` 事件到达顺序排队播放。
+  到达。
+- 前端不应收到 `audio` 就立刻抢占播放器。应使用全局播放调度器，按
+  `request_id + turn_id` 或 `request_id + followup_turn_id` 分组缓存，并按每组
+  第一次出现的顺序排队。当前组必须等对应 `done` 或 `followup_done` 到达，且
+  已缓存 chunk 播完后，才能切换到下一组。
 - TTS 文本仍会先经过 reply tag 过滤，`[emo:...]` / `[act:...]` 不会进入语音
   合成文本。
-- `audio.chunk_index` 是整次响应内的音频 chunk 序号，`audio.segment_index` 是
-  本次回复内的 TTS 文本片段序号。
+- initial `audio` 事件会带 `request_id`、`turn_id`、`conversation_id` 和
+  `phase=initial`，供前端归属播放任务。
+- `audio.chunk_index` 是当前回复播放任务内的音频 chunk 序号，不能单独作为全局
+  排序键；`audio.segment_index` 是本次回复内的 TTS 文本片段序号。
 - `done` 在文本流和最后一个 TTS 片段都发送完成后返回；`done.audio_base64`
   仍为 `null`，避免重复返回完整音频。
 - 当 `tts_enabled=false` 时，不发送 `audio` 事件。
@@ -387,10 +393,10 @@ data: {"conversation_id":"string","request_id":"req_xxx","parent_user_turn_id":"
 
 ```text
 event: audio
-data: {"conversation_id":"string","request_id":"req_xxx","followup_turn_id":"turn_xxx","phase":"followup","audio_base64":"base64 encoded 24kHz 16-bit mono PCM chunk","audio_format":"pcm","sample_rate":24000,"chunk_index":0}
+data: {"conversation_id":"string","request_id":"req_xxx","turn_id":"turn_xxx","followup_turn_id":"turn_xxx","phase":"followup","audio_base64":"base64 encoded 24kHz 16-bit mono PCM chunk","audio_format":"pcm","sample_rate":24000,"chunk_index":0}
 
 event: followup_done
-data: {"conversation_id":"string","request_id":"req_xxx","followup_turn_id":"turn_xxx","phase":"followup","audio_base64":null,"audio_format":"pcm"}
+data: {"conversation_id":"string","request_id":"req_xxx","turn_id":"turn_xxx","followup_turn_id":"turn_xxx","phase":"followup","audio_base64":null,"audio_format":"pcm"}
 ```
 
 约定：
@@ -401,6 +407,10 @@ data: {"conversation_id":"string","request_id":"req_xxx","followup_turn_id":"tur
 - TTS 文本会先经过 reply tag 过滤，`[emo:...]` / `[act:...]` 不会进入语音。
 - `followup_done` 表示当前二次回复的语音分片已发送完毕；纯文本模式不会发送
   `followup_done`。
+- 前端应把 follow-up 语音按 `request_id + followup_turn_id` 归属到独立播放任务，
+  并交给同一个全局播放调度器；不能用 `chunk_index` 与 initial reply 语音混排。
+  为兼容通用播放调度器，follow-up `audio` 和 `followup_done` 也会带
+  `turn_id=followup_turn_id`。
 - 连接空闲时服务端可能发送 `ping` keepalive 事件。
 
 ---

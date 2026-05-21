@@ -396,6 +396,10 @@ class VoiceApiRoutesTest(unittest.TestCase):
         assert events[4]["data"]["audio_format"] == "pcm"
         assert events[4]["data"]["sample_rate"] == 24000
         assert events[4]["data"]["chunk_index"] == 0
+        assert events[4]["data"]["request_id"] == events[1]["data"]["request_id"]
+        assert events[4]["data"]["turn_id"] == events[1]["data"]["turn_id"]
+        assert events[4]["data"]["conversation_id"] == "conv-latency"
+        assert events[4]["data"]["phase"] == "initial"
         assert events[5]["data"]["audio_base64"] == base64.b64encode(b"audio-b").decode(
             "ascii"
         )
@@ -454,6 +458,9 @@ class VoiceApiRoutesTest(unittest.TestCase):
         ]
         assert tts_calls == ["第一句。", "第二句"]
         assert events[3]["data"]["segment_index"] == 0
+        assert events[3]["data"]["request_id"] == events[1]["data"]["request_id"]
+        assert events[3]["data"]["turn_id"] == events[1]["data"]["turn_id"]
+        assert events[3]["data"]["phase"] == "initial"
         assert events[5]["data"]["segment_index"] == 1
         assert events[-1]["data"]["reply"] == "第一句。[emo:angry]第二句[act:开心]"
 
@@ -549,6 +556,10 @@ class VoiceApiRoutesTest(unittest.TestCase):
         assert events[4]["data"]["audio_base64"] == base64.b64encode(b"live-audio").decode(
             "ascii"
         )
+        assert events[4]["data"]["request_id"] == events[1]["data"]["request_id"]
+        assert events[4]["data"]["turn_id"] == events[1]["data"]["turn_id"]
+        assert events[4]["data"]["conversation_id"] == "conv-live"
+        assert events[4]["data"]["phase"] == "initial"
         assert tts.streamed_text == "正式回复"
         done = events[-1]["data"]
         assert done["conversation_id"] == "conv-live"

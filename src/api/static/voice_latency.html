@@ -266,8 +266,7 @@
     const targetSampleRate = 16000;
     const chunkBytes = 5120;
     let audioContext = null;
-    let playbackContext = null;
-    let playbackCursorTime = 0;
+    let audioPlaybackScheduler = null;
     let sourceNode = null;
     let processorNode = null;
     let stream = null;
@@ -317,7 +316,13 @@
       const stoppedAt = performance.now();
       let firstDeltaReceived = false;
       const deltas = [];
-      if (ttsEnabledInput.checked) ensurePlaybackContext();
+      let latestInitialAudioIdentity = {};
+      if (ttsEnabledInput.checked) {
+        audioPlaybackScheduler = new AudioPlaybackScheduler(
+          () => setStatus("正在播放 TTS..."),
+          () => setStatus("完成"),
+        );
+      }
       setStatus("正在结束 ASR 并等待模型流式回复...");
       stopAudioGraph();
       stopButton.disabled = true;
@@ -333,6 +338,15 @@
             transcriptEl.textContent = event.data.transcript || transcriptEl.textContent;
             return;
           }
+          if (event.event === "meta") {
+            latestInitialAudioIdentity = {
+              conversation_id: event.data.conversation_id || "",
+              request_id: event.data.request_id || "",
+              turn_id: event.data.turn_id || "",
+              phase: "initial",
+            };
+            return;
+          }
           if (event.event === "delta") {
             if (!firstDeltaReceived) {
               firstDeltaReceived = true;
@@ -346,17 +360,25 @@
             return;
           }
           if (event.event === "audio") {
-            playPcmChunk(
-              base64ToBytes(event.data.audio_base64 || ""),
-              event.data.sample_rate || 24000,
-            );
-            setStatus("正在播放 TTS...");
+            if (audioPlaybackScheduler) {
+              audioPlaybackScheduler.enqueue({
+                ...latestInitialAudioIdentity,
+                ...event.data,
+              });
+            }
             return;
           }
           if (event.event === "done") {
+            if (audioPlaybackScheduler) audioPlaybackScheduler.markDone(event.data);
             transcriptEl.textContent = event.data.transcript || transcriptEl.textContent;
             replyEl.textContent = event.data.reply || replyEl.textContent;
-            setStatus("完成");
+            if (!audioPlaybackScheduler || audioPlaybackScheduler.isIdle()) {
+              setStatus("完成");
+            }
+            return;
+          }
+          if (event.event === "followup_done") {
+            if (audioPlaybackScheduler) audioPlaybackScheduler.markDone(event.data);
             return;
           }
           if (event.event === "error") {
@@ -440,30 +462,176 @@
       return output;
     }
 
-    function ensurePlaybackContext() {
-      if (!playbackContext) {
-        playbackContext = new AudioContext();
-        playbackCursorTime = playbackContext.currentTime + 0.05;
+    class AudioPlaybackScheduler {
+      constructor(onPlay, onIdle) {
+        this.onPlay = onPlay;
+        this.onIdle = onIdle;
+        this.context = null;
+        this.tasks = new Map();
+        this.queue = [];
+        this.currentKey = "";
+        this.currentSource = null;
+        this.arrivalIndex = 0;
+        this.stopped = false;
       }
-      if (playbackContext.state === "suspended") playbackContext.resume();
-    }
 
-    function playPcmChunk(bytes, sampleRate) {
-      if (!bytes.length) return;
-      ensurePlaybackContext();
-      const samples = Math.floor(bytes.length / 2);
-      const buffer = playbackContext.createBuffer(1, samples, sampleRate);
-      const channel = buffer.getChannelData(0);
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      for (let i = 0; i < samples; i += 1) {
-        channel[i] = view.getInt16(i * 2, true) / 0x8000;
+      isIdle() {
+        return !this.currentSource && !this.currentKey && this.queue.length === 0;
       }
-      const source = playbackContext.createBufferSource();
-      source.buffer = buffer;
-      source.connect(playbackContext.destination);
-      const startAt = Math.max(playbackCursorTime, playbackContext.currentTime + 0.02);
-      source.start(startAt);
-      playbackCursorTime = startAt + buffer.duration;
+
+      enqueue(data) {
+        const bytes = base64ToBytes(data.audio_base64 || "");
+        if (!bytes.length || this.stopped) return;
+        const task = this.taskFor(data);
+        const chunk = {
+          bytes,
+          sampleRate: data.sample_rate || 24000,
+          chunkIndex: Number.isFinite(data.chunk_index) ? data.chunk_index : null,
+          arrivalIndex: this.arrivalIndex,
+        };
+        this.arrivalIndex += 1;
+        this.insertChunk(task, chunk);
+        this.pump();
+      }
+
+      markDone(data) {
+        if (this.stopped) return;
+        const task = this.taskFor(data);
+        task.done = true;
+        this.pump();
+      }
+
+      stop() {
+        this.stopped = true;
+        if (this.currentSource) {
+          try {
+            this.currentSource.stop();
+          } catch (_error) {
+          }
+        }
+        this.currentSource = null;
+        this.tasks.clear();
+        this.queue = [];
+        this.currentKey = "";
+        if (this.context) this.context.close();
+        this.context = null;
+      }
+
+      taskFor(data) {
+        const key = this.taskKey(data);
+        let task = this.tasks.get(key);
+        if (!task) {
+          task = { key, chunks: [], done: false };
+          this.tasks.set(key, task);
+          this.queue.push(key);
+        }
+        return task;
+      }
+
+      taskKey(data) {
+        const requestId = this.stringField(data, "request_id") || "request:unknown";
+        const turnId =
+          this.stringField(data, "followup_turn_id") ||
+          this.stringField(data, "turn_id") ||
+          this.stringField(data, "parent_initial_reply_turn_id") ||
+          this.stringField(data, "phase") ||
+          "turn:legacy";
+        return `${requestId}:${turnId}`;
+      }
+
+      stringField(data, key) {
+        const value = data[key];
+        return typeof value === "string" && value.trim() ? value : "";
+      }
+
+      insertChunk(task, chunk) {
+        if (chunk.chunkIndex === null) {
+          task.chunks.push(chunk);
+          return;
+        }
+        const index = task.chunks.findIndex((item) => {
+          if (item.chunkIndex === null) return false;
+          if (item.chunkIndex === chunk.chunkIndex) {
+            return item.arrivalIndex > chunk.arrivalIndex;
+          }
+          return item.chunkIndex > chunk.chunkIndex;
+        });
+        if (index === -1) {
+          task.chunks.push(chunk);
+        } else {
+          task.chunks.splice(index, 0, chunk);
+        }
+      }
+
+      pump() {
+        if (this.stopped || this.currentSource) return;
+        if (!this.currentKey) this.currentKey = this.nextKey();
+        if (!this.currentKey) {
+          this.onIdle();
+          return;
+        }
+
+        const task = this.tasks.get(this.currentKey);
+        if (!task) {
+          this.currentKey = "";
+          this.pump();
+          return;
+        }
+
+        if (task.chunks.length > 0) {
+          const chunk = task.chunks.shift();
+          this.play(chunk);
+          return;
+        }
+
+        if (task.done) {
+          this.tasks.delete(task.key);
+          if (this.queue[0] === task.key) this.queue.shift();
+          this.currentKey = "";
+          this.pump();
+        }
+      }
+
+      nextKey() {
+        while (this.queue.length > 0) {
+          const key = this.queue[0];
+          if (this.tasks.has(key)) return key;
+          this.queue.shift();
+        }
+        return "";
+      }
+
+      play(chunk) {
+        const source = this.createSource(chunk.bytes, chunk.sampleRate);
+        this.currentSource = source;
+        source.onended = () => {
+          if (this.currentSource === source) this.currentSource = null;
+          this.pump();
+        };
+        this.onPlay();
+        source.start();
+      }
+
+      createSource(bytes, sampleRate) {
+        const context = this.ensureContext();
+        const samples = Math.floor(bytes.length / 2);
+        const buffer = context.createBuffer(1, samples, sampleRate);
+        const channel = buffer.getChannelData(0);
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        for (let i = 0; i < samples; i += 1) {
+          channel[i] = view.getInt16(i * 2, true) / 0x8000;
+        }
+        const source = context.createBufferSource();
+        source.buffer = buffer;
+        source.connect(context.destination);
+        return source;
+      }
+
+      ensureContext() {
+        if (!this.context) this.context = new AudioContext();
+        if (this.context.state === "suspended") this.context.resume();
+        return this.context;
+      }
     }
 
     async function pollTranscript() {
@@ -586,9 +754,8 @@
     }
 
     function resetPlayback() {
-      if (playbackContext) playbackContext.close();
-      playbackContext = null;
-      playbackCursorTime = 0;
+      if (audioPlaybackScheduler) audioPlaybackScheduler.stop();
+      audioPlaybackScheduler = null;
     }
 
     function setStatus(message) {

@@ -528,6 +528,7 @@ def _iter_voice_reply_stream_events(
     output_queue: queue.Queue[Any] = queue.Queue()
     tts_queue: queue.Queue[Any] = queue.Queue()
     done_holder: dict[str, dict] = {}
+    audio_identity_holder: dict[str, dict] = {}
 
     def enqueue_tts_segment(raw_text: str) -> None:
         tts_text = prepare_tts_text(raw_text)
@@ -538,6 +539,17 @@ def _iter_voice_reply_stream_events(
         segmenter = _StreamingTtsSegmenter()
         try:
             for item in chat_events_factory():
+                if item.get("event") == "meta":
+                    data = item.get("data", {})
+                    audio_identity_holder["data"] = {
+                        "conversation_id": data.get("conversation_id", ""),
+                        "request_id": data.get("request_id", ""),
+                        "turn_id": data.get("turn_id", ""),
+                        "phase": "initial",
+                    }
+                    output_queue.put(item)
+                    continue
+
                 if item.get("event") == "delta":
                     output_queue.put(item)
                     delta = item.get("data", {}).get("delta")
@@ -547,6 +559,14 @@ def _iter_voice_reply_stream_events(
                     continue
 
                 if item.get("event") == "done":
+                    data = item.get("data", {})
+                    if "data" not in audio_identity_holder:
+                        audio_identity_holder["data"] = {
+                            "conversation_id": data.get("conversation_id", ""),
+                            "request_id": data.get("request_id", ""),
+                            "turn_id": data.get("turn_id", ""),
+                            "phase": "initial",
+                        }
                     for segment in segmenter.flush():
                         enqueue_tts_segment(segment)
                     done_holder["event"] = _voice_done_event(item, transcript)
@@ -599,16 +619,20 @@ def _iter_voice_reply_stream_events(
                 for chunk in chunks:
                     if not chunk:
                         continue
+                    audio_data = dict(audio_identity_holder.get("data", {}))
+                    audio_data.update(
+                        {
+                            "audio_base64": base64.b64encode(chunk).decode("ascii"),
+                            "audio_format": "pcm",
+                            "sample_rate": sample_rate,
+                            "chunk_index": chunk_index,
+                            "segment_index": segment_index,
+                        }
+                    )
                     output_queue.put(
                         {
                             "event": "audio",
-                            "data": {
-                                "audio_base64": base64.b64encode(chunk).decode("ascii"),
-                                "audio_format": "pcm",
-                                "sample_rate": sample_rate,
-                                "chunk_index": chunk_index,
-                                "segment_index": segment_index,
-                            },
+                            "data": audio_data,
                         }
                     )
                     chunk_index += 1
@@ -860,6 +884,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 audio_event_base = {
                     "conversation_id": payload.get("conversation_id", conversation_id),
                     "request_id": payload.get("request_id", ""),
+                    "turn_id": payload.get("followup_turn_id", ""),
                     "followup_turn_id": payload.get("followup_turn_id", ""),
                     "phase": "followup",
                 }

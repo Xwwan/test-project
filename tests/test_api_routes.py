@@ -187,6 +187,7 @@ class ApiRoutesTest(unittest.TestCase):
         ]
         assert tts.streamed_text == "补充一下。"
         assert events[1]["data"]["request_id"] == "req-1"
+        assert events[1]["data"]["turn_id"] == "turn-followup"
         assert events[1]["data"]["followup_turn_id"] == "turn-followup"
         assert events[1]["data"]["phase"] == "followup"
         assert events[1]["data"]["audio_base64"] == base64.b64encode(b"audio-a").decode(
@@ -198,6 +199,7 @@ class ApiRoutesTest(unittest.TestCase):
         assert events[3]["data"] == {
             "conversation_id": "conv-1",
             "request_id": "req-1",
+            "turn_id": "turn-followup",
             "followup_turn_id": "turn-followup",
             "phase": "followup",
             "audio_base64": None,
