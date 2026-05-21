@@ -78,12 +78,13 @@
 
 ## 3. `POST /chat/stream`
 
-请求与 `/chat` 相同：
+请求与 `/chat` 基本相同，可选开启 TTS：
 
 ```json
 {
   "conversation_id": "string",
-  "message": "string"
+  "message": "string",
+  "tts_enabled": false
 }
 ```
 
@@ -100,13 +101,33 @@ event: done
 data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"string","reply":"完整回复","retrieval_status":"pending","retrieved_memory_ids":[]}
 ```
 
+当 `tts_enabled=true` 时，文本 `delta` 之外会额外发送 `audio` 事件：
+
+```text
+event: audio
+data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"string","phase":"initial","audio_base64":"base64 encoded 24kHz 16-bit mono PCM chunk","audio_format":"pcm","sample_rate":24000,"chunk_index":0,"segment_index":0}
+
+event: done
+data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation_id":"string","reply":"完整回复","retrieval_status":"pending","retrieved_memory_ids":[],"audio_base64":null,"audio_format":"pcm"}
+```
+
 约定：
 
 - `meta` 会在模型开始生成前返回，便于客户端提前绑定 `request_id` 与
   `turn_id`。
 - `delta` 可出现多次，每次只包含新增文本片段。
+- `tts_enabled` 默认为 `false`。当 `tts_enabled=true` 时，服务端会复用语音入口
+  的 TTS 分段逻辑，把 initial reply 的可播音频作为 `audio` 事件插入同一条
+  initial stream。
+- `audio` 事件会带 `request_id`、`turn_id`、`conversation_id` 和
+  `phase=initial`，供前端归属播放任务；`audio.chunk_index` 只在当前播放任务内
+  有序，不能与 follow-up 音频全局混排。
+- TTS 文本会先经过 reply tag 过滤，`[emo:...]` / `[act:...]` 不会进入语音合成
+  文本。
 - `done` 表示首条回复已经完整生成并保存，`data` 包含聚合后的完整
   `reply`。
+- 当 `tts_enabled=true` 时，`done.audio_base64` 仍为 `null`，避免重复返回完整
+  音频。
 - 流式接口的 retrieval 默认在后台继续执行，因此 `done.data.retrieval_status`
   通常为 `pending`，`retrieved_memory_ids` 在该事件中为空数组。
 - 后台 retrieval 完成后，请求会进入 `/followups/pending`，客户端可按需

@@ -309,7 +309,7 @@ def iter_voice_latency_finish_stream(
         },
     }
 
-    yield from _iter_voice_reply_stream_events(
+    yield from _iter_dialogue_reply_stream_events(
         lambda: handle_chat_message_stream(
             request.conversation_id,
             transcript,
@@ -347,7 +347,7 @@ def iter_voice_live_finish_stream(
         },
     }
 
-    yield from _iter_voice_reply_stream_events(
+    yield from _iter_dialogue_reply_stream_events(
         lambda: handle_chat_message_stream(
             request.conversation_id,
             transcript,
@@ -510,17 +510,22 @@ class _StreamWorkerError:
         self.error = error
 
 
-def _iter_voice_reply_stream_events(
+def _iter_dialogue_reply_stream_events(
     chat_events_factory: Callable[[], Iterable[dict]],
     *,
-    transcript: str,
+    transcript: str | None = None,
     tts_enabled: bool,
     audio_dependencies: AudioDependencies | None = None,
 ):
+    include_audio_done_fields = tts_enabled or transcript is not None
     if not tts_enabled:
         for item in chat_events_factory():
             if item.get("event") == "done":
-                yield _voice_done_event(item, transcript)
+                yield _dialogue_done_event(
+                    item,
+                    transcript=transcript,
+                    include_audio_fields=include_audio_done_fields,
+                )
                 continue
             yield item
         return
@@ -569,7 +574,11 @@ def _iter_voice_reply_stream_events(
                         }
                     for segment in segmenter.flush():
                         enqueue_tts_segment(segment)
-                    done_holder["event"] = _voice_done_event(item, transcript)
+                    done_holder["event"] = _dialogue_done_event(
+                        item,
+                        transcript=transcript,
+                        include_audio_fields=include_audio_done_fields,
+                    )
                     tts_queue.put(_TTS_SENTINEL)
                     return
 
@@ -660,11 +669,18 @@ def _iter_voice_reply_stream_events(
         tts_queue.put(_TTS_SENTINEL)
 
 
-def _voice_done_event(item: dict, transcript: str) -> dict:
+def _dialogue_done_event(
+    item: dict,
+    *,
+    transcript: str | None = None,
+    include_audio_fields: bool = False,
+) -> dict:
     data = dict(item.get("data", {}))
-    data["transcript"] = transcript
-    data["audio_base64"] = None
-    data["audio_format"] = "pcm"
+    if transcript is not None:
+        data["transcript"] = transcript
+    if include_audio_fields:
+        data["audio_base64"] = None
+        data["audio_format"] = "pcm"
     return {"event": "done", "data": data}
 
 
@@ -837,10 +853,14 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            for item in handle_chat_message_stream(
-                request.conversation_id,
-                request.message,
-                dependencies=type(self).injected_dependencies,
+            for item in _iter_dialogue_reply_stream_events(
+                lambda: handle_chat_message_stream(
+                    request.conversation_id,
+                    request.message,
+                    dependencies=type(self).injected_dependencies,
+                ),
+                tts_enabled=request.tts_enabled,
+                audio_dependencies=type(self).injected_audio_dependencies,
             ):
                 event = item.get("event", "message")
                 data = item.get("data", {})

@@ -30,10 +30,19 @@ def _optional_str(value: Any, field_name: str) -> str:
     return value
 
 
+def _optional_bool(value: Any, field_name: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise SchemaError(f"{field_name} must be a boolean")
+    return value
+
+
 @dataclass
 class ChatRequest:
     conversation_id: str
     message: str
+    tts_enabled: bool = False
 
     @classmethod
     def from_dict(cls, data: Any) -> "ChatRequest":
@@ -42,6 +51,7 @@ class ChatRequest:
         return cls(
             conversation_id=_require_str(data.get("conversation_id"), "conversation_id"),
             message=_require_str(data.get("message"), "message"),
+            tts_enabled=_optional_bool(data.get("tts_enabled"), "tts_enabled", False),
         )
 
     def to_dict(self) -> dict:

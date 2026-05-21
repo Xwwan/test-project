@@ -162,6 +162,62 @@ followup_done
 
 这样 initial reply 和二次回复从协议层就分开。
 
+### 4. 文字输入与语音输入应复用同一条回复链路
+
+语音输入和文字输入只应在输入适配层不同：
+
+```text
+文字输入
+-> message
+
+语音输入
+-> STT transcript
+-> message
+```
+
+一旦得到 `message`，后续应进入同一套 dialogue orchestration：
+
+```text
+message
+-> handle_chat_message_stream
+-> meta
+-> initial delta
+-> done
+-> 后台 retrieval
+-> conversation follow-up stream
+```
+
+TTS、`transcript` 和音频播放任务归属字段属于输出增强能力，不应改变主回复
+生命周期。也就是说：
+
+- `/chat/stream` 和 `/voice/live/finish-stream` 的 initial reply 应共享同一套
+  文本流生成与 retrieval/follow-up 生命周期。
+- `/voice/live/finish-stream` 只应比 `/chat/stream` 多一个前置
+  `transcript` 事件，用于告诉客户端 ASR 最终文本。
+- `tts_enabled=true` 时，文字输入和语音输入都可以在相同 initial stream 上额外
+  收到 `audio` 事件；`tts_enabled=false` 时则只返回文本事件。
+- follow-up 二次回复不应混回任意 initial stream。前端应额外订阅
+  `/followups/stream?conversation_id=...&tts_enabled=true|false`，并把其中的
+  follow-up 文本和可选 `audio` 事件渲染为独立 assistant 消息。
+- `/tools/voice-latency/finish-stream` 是延迟测试专用入口，可以继续使用 no-db
+  依赖；正常产品前端不应依赖它来代表真实文字/语音对话行为。
+
+推荐最终形态是抽出共享 helper，例如：
+
+```text
+iter_dialogue_reply_stream(
+  conversation_id,
+  message,
+  transcript=None,
+  tts_enabled=False,
+  dependencies=None,
+  audio_dependencies=None,
+)
+```
+
+其中 `transcript` 只用于语音入口额外输出 `transcript` 事件；对话生成、状态流转、
+retrieval 和 follow-up 归属仍全部以统一的 `message` 进入系统。
+
 ## 推荐架构
 
 ### 1. 请求快照
@@ -576,6 +632,23 @@ generate_followup_reply 返回 no_followup
 - 增加 retrieval/followup/delivery 细粒度状态。
 - 后台失败不再覆盖 initial reply 成功状态。
 - 补并发、乱序、失败隔离测试。
+
+### 阶段四：统一文字与语音回复输出链路
+
+- 抽出共享 initial reply stream helper，使 `/chat/stream` 与
+  `/voice/live/finish-stream` 在得到文本 message 后复用同一套生成、保存、
+  retrieval pending 和 `done` 逻辑。
+- 为 `/chat/stream` 增加可选 `tts_enabled` 参数；启用时在文本 `delta` 之外发送
+  与语音入口相同结构的 `audio` 事件。
+- 保持 `/voice/live/finish-stream` 的语音特有职责仅限于结束 ASR、输出
+  `transcript` 事件，然后把 transcript 当作普通 message 交给共享链路。
+- 前端统一使用同一个 audio playback scheduler 处理 initial reply 与
+  `/followups/stream` 中的 follow-up TTS，但必须按 `request_id + turn_id` 或
+  `request_id + followup_turn_id` 分组，不能用全局 `chunk_index` 混排。
+- 正常产品前端改用 `/voice/live/finish-stream`；`/tools/voice-latency/finish-stream`
+  仅保留为 no-db 延迟测试工具。
+- 补充文字输入启用 TTS、语音输入启用 TTS、follow-up 启用 TTS 三类协议一致性
+  测试。
 
 ## 文件影响范围
 

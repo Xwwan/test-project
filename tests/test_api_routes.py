@@ -154,6 +154,43 @@ class ApiRoutesTest(unittest.TestCase):
         assert events[2]["data"]["retrieval_status"] == "pending"
         assert events[2]["data"]["retrieved_memory_ids"] == []
 
+    def test_chat_stream_yields_tts_audio_when_enabled(self) -> None:
+        deps, _, _ = _build_dependencies(initial_reply="文字[emo:happy]回复[act:wave]。")
+        tts = FakeStreamingTts([b"text-audio"])
+        handler = _FakeStreamHandler(
+            deps,
+            audio_dependencies=AudioDependencies(tts_client=tts),
+        )
+
+        ChatRequestHandler._write_chat_stream(
+            handler,
+            {
+                "conversation_id": "conv-1",
+                "message": "你好",
+                "tts_enabled": True,
+            },
+        )
+
+        events = _parse_sse_events(handler.wfile.getvalue().decode("utf-8"))
+        assert [event["event"] for event in events] == [
+            "meta",
+            "delta",
+            "audio",
+            "done",
+        ]
+        assert tts.streamed_text == "文字回复。"
+        assert events[2]["data"]["audio_base64"] == base64.b64encode(
+            b"text-audio"
+        ).decode("ascii")
+        assert events[2]["data"]["request_id"] == events[0]["data"]["request_id"]
+        assert events[2]["data"]["turn_id"] == events[0]["data"]["turn_id"]
+        assert events[2]["data"]["conversation_id"] == "conv-1"
+        assert events[2]["data"]["phase"] == "initial"
+        assert events[-1]["data"]["reply"] == "文字[emo:happy]回复[act:wave]。"
+        assert events[-1]["data"]["audio_base64"] is None
+        assert events[-1]["data"]["audio_format"] == "pcm"
+        assert "transcript" not in events[-1]["data"]
+
     def test_followups_stream_yields_audio_when_tts_enabled(self) -> None:
         deps, _, _ = _build_dependencies()
         tts = FakeStreamingTts([b"audio-a", b"audio-b"])
