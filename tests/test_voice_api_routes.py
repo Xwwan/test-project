@@ -219,6 +219,31 @@ class VoiceApiRoutesTest(unittest.TestCase):
         assert tts_calls == ["回复:实时文本"]
         assert manager.finished == ["live-1"]
 
+    def test_live_voice_finish_transcript_returns_final_text_without_chat(self) -> None:
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="只要文本",
+            is_final=True,
+            error=None,
+        )
+
+        status, body = dispatch(
+            "POST",
+            "/voice/live/finish-transcript",
+            {"session_id": "live-1"},
+            live_asr_manager=manager,
+        )
+
+        assert status == 200
+        assert body == {
+            "session_id": "live-1",
+            "transcript": "只要文本",
+            "is_final": True,
+            "error": None,
+        }
+        assert manager.finished == ["live-1"]
+        assert manager.aborted == []
+
     def test_voice_latency_finish_generates_reply_without_persisting_turns(self) -> None:
         manager = FakeLiveAsrManager()
         manager.states["live-1"] = LiveTranscriptState(

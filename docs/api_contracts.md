@@ -17,6 +17,7 @@
 | `POST` | `/voice/live/start` | 开始实时语音识别会话 |
 | `POST` | `/voice/live/chunk` | 向实时语音识别会话提交一段 PCM 音频 |
 | `GET`  | `/voice/live/transcript` | 查询实时语音识别会话的最新字幕 |
+| `POST` | `/voice/live/finish-transcript` | 结束实时语音识别会话，只返回最终识别文本 |
 | `POST` | `/voice/live/finish` | 结束实时语音识别会话，并用最终文本生成回复和可选语音 |
 | `POST` | `/voice/live/abort` | 中止实时语音识别会话，不生成回复 |
 | `POST` | `/tools/voice-latency/finish-stream` | 结束实时语音识别会话，并以 SSE 流式返回延迟测试回复 |
@@ -181,15 +182,16 @@ data: {"message":"human readable reason"}
 ## 5. 实时语音接口
 
 实时语音接口面向 Reachy app 一类的外部采集端：采集端负责录音、降采样和分块；
-`test-project` 负责持有火山 ASR WebSocket、维护实时字幕，并在结束时复用现有
-文本对话和 TTS 流程。
+`test-project` 负责持有火山 ASR WebSocket、维护实时字幕，并按结束接口决定只返回
+最终文本，或继续复用现有文本对话和 TTS 流程。
 
 音频约定：
 
 - PCM little-endian，16kHz，16-bit，mono。
 - 推荐 chunk 为 160ms，即 `5120` bytes。
 - 服务端接受最后一个普通 chunk 小于 `5120` bytes。
-- 停止录音时应调用 `/voice/live/finish`，不要再次把整段音频发到 `/voice/chat`。
+- 停止录音并发送对话时应调用 `/voice/live/finish`；只需要 STT 文本时应调用
+  `/voice/live/finish-transcript`。不要再次把整段音频发到 `/voice/chat`。
 
 ### 5.1 `POST /voice/live/start`
 
@@ -245,7 +247,8 @@ data: {"message":"human readable reason"}
 约定：
 
 - `audio_base64` 必须是合法且非空的 base64。
-- 第一阶段推荐 `is_final=false`，统一由 `/voice/live/finish` 发送 ASR final packet。
+- 第一阶段推荐 `is_final=false`，统一由 `/voice/live/finish-transcript` 或
+  `/voice/live/finish` 发送 ASR final packet。
 
 ### 5.3 `GET /voice/live/transcript?session_id=...`
 
@@ -265,7 +268,36 @@ data: {"message":"human readable reason"}
 - 采集端可以每 200-300ms 轮询一次。
 - `error` 非空时表示 ASR 会话已出现可展示错误，采集端应停止继续提交 chunk。
 
-### 5.4 `POST /voice/live/finish`
+### 5.4 `POST /voice/live/finish-transcript`
+
+请求：
+
+```json
+{
+  "session_id": "live_<uuid4_hex>"
+}
+```
+
+响应：
+
+```json
+{
+  "session_id": "live_<uuid4_hex>",
+  "transcript": "你好 Reachy",
+  "is_final": true,
+  "error": null
+}
+```
+
+约定：
+
+- 服务端会向火山 ASR 发送空音频 final packet，并等待最终文本。
+- 该接口只返回最终 `transcript`，不调用 chat、memory retrieval 或 TTS，也不写入
+  对话历史。
+- finish 成功或失败后，该 live session 都会从内存 manager 中移除。
+- 当前端只需要 STT 文本、不希望自动发送对话时，应使用该接口。
+
+### 5.5 `POST /voice/live/finish`
 
 请求：
 
@@ -299,7 +331,7 @@ data: {"message":"human readable reason"}
 - 拿到最终 `transcript` 后直接复用现有文本对话和 TTS 流程，不再二次 STT。
 - finish 成功或失败后，该 live session 都会从内存 manager 中移除。
 
-### 5.5 `POST /voice/live/abort`
+### 5.6 `POST /voice/live/abort`
 
 请求：
 
@@ -319,8 +351,10 @@ data: {"message":"human readable reason"}
 
 - 用于取消录音或页面关闭。
 - 只关闭 ASR 会话，不调用 chat、memory retrieval 或 TTS。
+- 不保证返回最终 transcript；如果需要最终文本但不生成回复，请使用
+  `/voice/live/finish-transcript`。
 
-### 5.6 `POST /tools/voice-latency/finish-stream`
+### 5.7 `POST /tools/voice-latency/finish-stream`
 
 该接口只供本地语音延迟测试页面使用。请求与 `/voice/live/finish` 相同：
 

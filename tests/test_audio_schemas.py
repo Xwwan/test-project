@@ -10,6 +10,7 @@ from src.audio.schemas import (
     LiveVoiceAbortRequest,
     LiveVoiceChunkRequest,
     LiveVoiceFinishRequest,
+    LiveVoiceFinishTranscriptRequest,
     LiveVoiceStartRequest,
     LiveVoiceStartResponse,
     LiveVoiceTranscriptResponse,
@@ -107,11 +108,15 @@ class AudioSchemasTest(unittest.TestCase):
         finish = LiveVoiceFinishRequest.from_dict(
             {"session_id": "live-1", "conversation_id": "conv-1", "tts_enabled": False}
         )
+        finish_transcript = LiveVoiceFinishTranscriptRequest.from_dict(
+            {"session_id": "live-1"}
+        )
         abort = LiveVoiceAbortRequest.from_dict({"session_id": "live-1"})
 
         assert finish.session_id == "live-1"
         assert finish.conversation_id == "conv-1"
         assert finish.tts_enabled is False
+        assert finish_transcript.session_id == "live-1"
         assert abort.session_id == "live-1"
 
     def test_live_voice_responses_serialize(self) -> None:

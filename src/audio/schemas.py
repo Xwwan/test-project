@@ -166,6 +166,17 @@ class LiveVoiceFinishRequest:
 
 
 @dataclass(frozen=True)
+class LiveVoiceFinishTranscriptRequest:
+    session_id: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "LiveVoiceFinishTranscriptRequest":
+        if not isinstance(data, dict):
+            raise SchemaError("live voice finish transcript request body must be a JSON object")
+        return cls(session_id=_require_str(data.get("session_id"), "session_id"))
+
+
+@dataclass(frozen=True)
 class LiveVoiceAbortRequest:
     session_id: str
 

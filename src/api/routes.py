@@ -36,6 +36,7 @@ from src.audio.schemas import (
     LiveVoiceAbortRequest,
     LiveVoiceChunkRequest,
     LiveVoiceFinishRequest,
+    LiveVoiceFinishTranscriptRequest,
     LiveVoiceStartRequest,
     LiveVoiceStartResponse,
     LiveVoiceTranscriptResponse,
@@ -113,6 +114,8 @@ def dispatch(
             return _post_voice_live_chunk(body, live_asr_manager)
         if method == "GET" and pure_path == "/voice/live/transcript":
             return _get_voice_live_transcript(query, live_asr_manager)
+        if method == "POST" and pure_path == "/voice/live/finish-transcript":
+            return _post_voice_live_finish_transcript(body, live_asr_manager)
         if method == "POST" and pure_path == "/voice/live/finish":
             return _post_voice_live_finish(
                 body,
@@ -256,6 +259,24 @@ def _post_voice_live_finish(
         tts_enabled=request.tts_enabled,
         dependencies=audio_dependencies,
         dialogue_dependencies=dependencies,
+    )
+    return 200, response.to_dict()
+
+
+def _post_voice_live_finish_transcript(
+    body: Any,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    request = LiveVoiceFinishTranscriptRequest.from_dict(body or {})
+    manager = live_asr_manager or get_default_live_asr_manager()
+    state = manager.finish_session(request.session_id)
+    if state.error:
+        raise ValueError(state.error)
+    response = LiveVoiceTranscriptResponse(
+        session_id=request.session_id,
+        transcript=state.transcript,
+        is_final=state.is_final,
+        error=state.error,
     )
     return 200, response.to_dict()
 
