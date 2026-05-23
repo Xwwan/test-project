@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import io
+import json
 import tempfile
 import threading
 import unittest
@@ -10,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.api.routes import (
+    ChatRequestHandler,
     dispatch,
     iter_voice_latency_finish_stream,
     iter_voice_live_finish_stream,
@@ -18,12 +21,17 @@ from src.coordinator import request_coordinator
 from src.audio.live_asr import LiveAsrSessionNotFoundError, LiveTranscriptState
 from src.audio.service import AudioDependencies
 from src.audio.schemas import LiveVoiceFinishRequest
+from src.interaction import store as interaction_store
+from src.memory import db
 from src.services import DialogueDependencies, iter_followup_events, reset_followup_delivery_bus
+from src.services.onboarding_service import OnboardingDependencies
 from src.persona import file_manager
 
 
 class VoiceApiRoutesTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        db.set_database_path(Path(self.temp_dir.name) / "app.db")
         request_coordinator.reset_store()
         reset_followup_delivery_bus()
 
@@ -31,6 +39,8 @@ class VoiceApiRoutesTest(unittest.TestCase):
         request_coordinator.reset_store()
         reset_followup_delivery_bus()
         file_manager.reset_data_dir()
+        db.reset_database_path()
+        self.temp_dir.cleanup()
 
     def test_post_voice_chat_returns_transcript_reply_and_audio(self) -> None:
         deps = AudioDependencies(
@@ -750,6 +760,319 @@ class VoiceApiRoutesTest(unittest.TestCase):
 
         assert status == 404
         assert "unknown live ASR session" in body["error"]["message"]
+
+    def test_interaction_live_start_chunk_transcript_and_abort(self) -> None:
+        session = interaction_store.create_session(
+            workflow="chat",
+            conversation_id="conv-1",
+            input_mode="local",
+        )
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="半句",
+            is_final=False,
+            error=None,
+        )
+
+        status, body = dispatch(
+            "POST",
+            "/interaction/live/start",
+            {
+                "interaction_session_id": session["interaction_session_id"],
+                "workflow": "chat",
+            },
+            live_asr_manager=manager,
+        )
+
+        assert status == 200
+        assert body["live_session_id"] == "live-1"
+        assert body["session_id"] == "live-1"
+        assert body["interaction_session_id"] == session["interaction_session_id"]
+        assert body["workflow"] == "chat"
+
+        status, body = dispatch(
+            "POST",
+            "/interaction/live/chunk",
+            {
+                "interaction_session_id": session["interaction_session_id"],
+                "workflow": "chat",
+                "live_session_id": "live-1",
+                "audio_base64": base64.b64encode(b"chunk").decode("ascii"),
+            },
+            live_asr_manager=manager,
+        )
+
+        assert status == 200
+        assert body["accepted_bytes"] == 5
+        assert body["live_session_id"] == "live-1"
+        assert manager.chunks == [("live-1", b"chunk")]
+
+        status, body = dispatch(
+            "GET",
+            (
+                "/interaction/live/transcript"
+                f"?interaction_session_id={session['interaction_session_id']}"
+                "&workflow=chat&live_session_id=live-1"
+            ),
+            live_asr_manager=manager,
+        )
+
+        assert status == 200
+        assert body["transcript"] == "半句"
+        assert body["is_final"] is False
+        assert body["live_session_id"] == "live-1"
+
+        status, body = dispatch(
+            "POST",
+            "/interaction/live/abort",
+            {
+                "interaction_session_id": session["interaction_session_id"],
+                "workflow": "chat",
+                "live_session_id": "live-1",
+            },
+            live_asr_manager=manager,
+        )
+
+        assert status == 200
+        assert body["ok"] is True
+        assert manager.aborted == ["live-1"]
+
+    def test_interaction_live_finish_stream_routes_chat_workflow(self) -> None:
+        session = interaction_store.create_session(
+            workflow="chat",
+            conversation_id="conv-live",
+            input_mode="local",
+        )
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="统一语音",
+            is_final=True,
+            error=None,
+        )
+
+        deps = DialogueDependencies(
+            read_model_profile=lambda: "model",
+            read_user_profile=lambda: "user",
+            apply_user_profile_patch=lambda patch: "",
+            append_turn=lambda conversation_id, turn: turn["turn_id"],
+            get_recent_history=lambda conversation_id, limit=20: [],
+            get_compact_history=lambda conversation_id: "",
+            update_compact_history=lambda conversation_id, value: None,
+            list_lightweight_memory_items=lambda status="active": [],
+            get_memory_items_by_ids=lambda ids: [],
+            apply_memory_operations=lambda operations: [],
+            generate_initial_reply_stream=lambda input_data, **kwargs: iter(
+                ["统一", "回复"]
+            ),
+            generate_initial_reply=lambda input_data, **kwargs: {
+                "request_id": input_data["request_id"],
+                "reply": "不应使用",
+            },
+            generate_followup_reply=lambda input_data, **kwargs: {
+                "request_id": input_data["request_id"],
+                "decision": "no_followup",
+                "followup_type": "none",
+                "reply": "",
+            },
+            retrieve_relevant_memory_ids=lambda **kwargs: {
+                "request_id": kwargs["request_id"],
+                "selected_memory_ids": [],
+            },
+            extract_memory_operations=lambda **kwargs: {"operations": []},
+            generate_user_profile_patch=lambda items, current, **kwargs: {
+                "should_update": False,
+                "patch": None,
+                "reason": "fake",
+            },
+        )
+        handler = _FakeStreamHandler(deps, live_asr_manager=manager)
+
+        ChatRequestHandler._write_interaction_live_finish_stream(
+            handler,
+            {
+                "interaction_session_id": session["interaction_session_id"],
+                "workflow": "chat",
+                "live_session_id": "live-1",
+                "tts_enabled": False,
+            },
+        )
+
+        events = _parse_sse_events(handler.wfile.getvalue().decode("utf-8"))
+        assert [event["event"] for event in events] == [
+            "transcript",
+            "meta",
+            "delta",
+            "delta",
+            "done",
+        ]
+        assert events[0]["data"]["transcript"] == "统一语音"
+        assert events[0]["data"]["run_id"] == events[1]["data"]["run_id"]
+        assert events[2]["data"]["workflow"] == "chat"
+        assert events[-1]["data"]["reply"] == "统一回复"
+        assert events[-1]["data"]["transcript"] == "统一语音"
+        assert events[-1]["data"]["retrieval_status"] == "pending"
+        assert manager.finished == ["live-1"]
+
+    def test_interaction_live_finish_stream_routes_onboarding_workflow(self) -> None:
+        onboarding_store = InMemoryOnboardingStore()
+
+        def control_agent(**kwargs):
+            return {
+                "stage_complete": False,
+                "onboarding_complete": False,
+                "next_question": "你住在哪儿？",
+                "collected_patch": {"preferred_name": "王叔"},
+                "confidence": 0.9,
+                "summary": "用户希望被称为王叔",
+            }
+
+        onboarding_deps = OnboardingDependencies(
+            create_session=onboarding_store.create_session,
+            get_session=onboarding_store.get_session,
+            update_session=onboarding_store.update_session,
+            run_step=control_agent,
+            generate_question=lambda **kwargs: "你好，我平时怎么称呼你？",
+            generate_reply_stream=lambda input_data, **kwargs: iter(
+                ["王叔，", "你住在哪儿？"]
+            ),
+            read_model_profile=lambda: "model",
+        )
+        status, created = dispatch(
+            "POST",
+            "/interaction/sessions",
+            {
+                "workflow": "onboarding",
+                "conversation_id": "conv-onb",
+                "input_mode": "local",
+            },
+            onboarding_dependencies=onboarding_deps,
+        )
+        assert status == 200
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="叫我王叔",
+            is_final=True,
+            error=None,
+        )
+        chat_deps = DialogueDependencies(
+            generate_initial_reply_stream=lambda input_data, **kwargs: (_ for _ in ()).throw(
+                AssertionError("onboarding voice must not enter chat")
+            )
+        )
+        handler = _FakeStreamHandler(
+            chat_deps,
+            live_asr_manager=manager,
+            onboarding_dependencies=onboarding_deps,
+        )
+
+        ChatRequestHandler._write_interaction_live_finish_stream(
+            handler,
+            {
+                "interaction_session_id": created["interaction_session_id"],
+                "workflow": "onboarding",
+                "live_session_id": "live-1",
+                "tts_enabled": False,
+            },
+        )
+
+        events = _parse_sse_events(handler.wfile.getvalue().decode("utf-8"))
+        assert [event["event"] for event in events] == [
+            "transcript",
+            "meta",
+            "delta",
+            "delta",
+            "state_delta",
+            "done",
+        ]
+        assert events[0]["data"]["workflow"] == "onboarding"
+        assert events[0]["data"]["transcript"] == "叫我王叔"
+        assert events[0]["data"]["run_id"] == events[1]["data"]["run_id"]
+        assert events[2]["data"]["delta"] == "王叔，"
+        assert events[-1]["data"]["reply"] == "王叔，你住在哪儿？"
+        assert "retrieval_status" not in events[-1]["data"]
+        assert "request_id" not in events[-1]["data"]
+        assert manager.finished == ["live-1"]
+
+
+class InMemoryOnboardingStore:
+    def __init__(self) -> None:
+        self.sessions = {}
+
+    def create_session(self, **kwargs):
+        session_id = kwargs.get("session_id") or f"onb-{len(self.sessions) + 1}"
+        session = {
+            "session_id": session_id,
+            "conversation_id": kwargs.get("conversation_id") or "",
+            "status": "active",
+            "stage": kwargs.get("stage", 1),
+            "collected": dict(kwargs.get("collected") or {}),
+            "turns": list(kwargs.get("turns") or []),
+            "final_payload": dict(kwargs.get("final_payload") or {}),
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "completed_at": None,
+        }
+        self.sessions[session_id] = session
+        return dict(session)
+
+    def get_session(self, session_id):
+        return dict(self.sessions[session_id])
+
+    def update_session(self, session_id, **kwargs):
+        session = dict(self.sessions[session_id])
+        for key in ("status", "stage", "collected", "turns", "final_payload"):
+            if key in kwargs and kwargs[key] is not None:
+                session[key] = kwargs[key]
+        self.sessions[session_id] = session
+        return dict(session)
+
+
+def _parse_sse_events(payload: str) -> list[dict]:
+    events = []
+    for frame in payload.strip().split("\n\n"):
+        event_name = None
+        data = None
+        for line in frame.splitlines():
+            if line.startswith("event: "):
+                event_name = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data = json.loads(line.removeprefix("data: "))
+        if event_name is not None and data is not None:
+            events.append({"event": event_name, "data": data})
+    return events
+
+
+class _FakeStreamHandler:
+    _write_sse_event = ChatRequestHandler._write_sse_event
+
+    def __init__(
+        self,
+        dependencies: DialogueDependencies,
+        *,
+        audio_dependencies: AudioDependencies | None = None,
+        live_asr_manager: FakeLiveAsrManager | None = None,
+        onboarding_dependencies: OnboardingDependencies | None = None,
+    ) -> None:
+        type(self).injected_dependencies = dependencies
+        type(self).injected_audio_dependencies = audio_dependencies
+        type(self).injected_live_asr_manager = live_asr_manager
+        type(self).injected_onboarding_dependencies = onboarding_dependencies
+        self.status: int | None = None
+        self.headers: list[tuple[str, str]] = []
+        self.wfile = io.BytesIO()
+
+    def send_response(self, status: int) -> None:
+        self.status = status
+
+    def send_header(self, key: str, value: str) -> None:
+        self.headers.append((key, value))
+
+    def end_headers(self) -> None:
+        return None
+
+    def _write_json(self, status: int, body: dict) -> None:
+        self.status = status
+        self.wfile.write(json.dumps(body).encode("utf-8"))
 
 
 class FakeLiveAsrManager:

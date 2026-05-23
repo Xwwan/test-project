@@ -9,6 +9,8 @@ provided so handlers can ``json.dumps`` responses without extra plumbing.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import base64
+import binascii
 from typing import Any
 
 
@@ -36,6 +38,23 @@ def _optional_bool(value: Any, field_name: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise SchemaError(f"{field_name} must be a boolean")
     return value
+
+
+def _require_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SchemaError(f"{field_name} must be an integer")
+    return value
+
+
+def _decode_base64(value: Any, field_name: str) -> bytes:
+    raw = _require_str(value, field_name)
+    try:
+        decoded = base64.b64decode(raw.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error) as exc:
+        raise SchemaError(f"{field_name} must be valid base64") from exc
+    if not decoded:
+        raise SchemaError(f"{field_name} must decode to non-empty bytes")
+    return decoded
 
 
 def _workflow(value: Any) -> str:
@@ -123,6 +142,102 @@ class InteractionTextStreamRequest:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass
+class InteractionLiveStartRequest:
+    interaction_session_id: str
+    workflow: str
+    sample_rate: int = 16000
+    channels: int = 1
+    audio_format: str = "pcm"
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "InteractionLiveStartRequest":
+        if not isinstance(data, dict):
+            raise SchemaError("interaction live start request body must be a JSON object")
+        audio_format = data.get("audio_format", "pcm")
+        if not isinstance(audio_format, str) or not audio_format:
+            raise SchemaError("audio_format must be a non-empty string")
+        return cls(
+            interaction_session_id=_require_str(
+                data.get("interaction_session_id"),
+                "interaction_session_id",
+            ),
+            workflow=_workflow(data.get("workflow")),
+            sample_rate=_require_int(data.get("sample_rate", 16000), "sample_rate"),
+            channels=_require_int(data.get("channels", 1), "channels"),
+            audio_format=audio_format,
+        )
+
+
+@dataclass
+class InteractionLiveChunkRequest:
+    interaction_session_id: str
+    workflow: str
+    live_session_id: str
+    audio_bytes: bytes
+    is_final: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "InteractionLiveChunkRequest":
+        if not isinstance(data, dict):
+            raise SchemaError("interaction live chunk request body must be a JSON object")
+        live_session_id = data.get("live_session_id") or data.get("session_id")
+        return cls(
+            interaction_session_id=_require_str(
+                data.get("interaction_session_id"),
+                "interaction_session_id",
+            ),
+            workflow=_workflow(data.get("workflow")),
+            live_session_id=_require_str(live_session_id, "live_session_id"),
+            audio_bytes=_decode_base64(data.get("audio_base64"), "audio_base64"),
+            is_final=_optional_bool(data.get("is_final"), "is_final", False),
+        )
+
+
+@dataclass
+class InteractionLiveSessionRequest:
+    interaction_session_id: str
+    workflow: str
+    live_session_id: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "InteractionLiveSessionRequest":
+        if not isinstance(data, dict):
+            raise SchemaError("interaction live request body must be a JSON object")
+        live_session_id = data.get("live_session_id") or data.get("session_id")
+        return cls(
+            interaction_session_id=_require_str(
+                data.get("interaction_session_id"),
+                "interaction_session_id",
+            ),
+            workflow=_workflow(data.get("workflow")),
+            live_session_id=_require_str(live_session_id, "live_session_id"),
+        )
+
+
+@dataclass
+class InteractionLiveFinishStreamRequest:
+    interaction_session_id: str
+    workflow: str
+    live_session_id: str
+    tts_enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "InteractionLiveFinishStreamRequest":
+        if not isinstance(data, dict):
+            raise SchemaError("interaction live finish request body must be a JSON object")
+        live_session_id = data.get("live_session_id") or data.get("session_id")
+        return cls(
+            interaction_session_id=_require_str(
+                data.get("interaction_session_id"),
+                "interaction_session_id",
+            ),
+            workflow=_workflow(data.get("workflow")),
+            live_session_id=_require_str(live_session_id, "live_session_id"),
+            tts_enabled=_optional_bool(data.get("tts_enabled"), "tts_enabled", True),
+        )
 
 
 @dataclass

@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, urlsplit
 
 from src.coordinator import RequestNotFoundError, RequestStateError, get_pending_followup_requests
+from src.interaction import store as interaction_store
 from src.interaction.store import InteractionSessionNotFoundError
 from src.audio.live_asr import (
     LiveAsrSessionManager,
@@ -67,6 +68,10 @@ from .schemas import (
     ChatResponse,
     FollowupDecisionResponse,
     InteractionSessionCreateRequest,
+    InteractionLiveChunkRequest,
+    InteractionLiveFinishStreamRequest,
+    InteractionLiveSessionRequest,
+    InteractionLiveStartRequest,
     InteractionTextStreamRequest,
     MemoryCurateRequest,
     MemoryCurateResponse,
@@ -127,6 +132,14 @@ def dispatch(
                 interaction_session_id,
                 onboarding_dependencies,
             )
+        if method == "POST" and pure_path == "/interaction/live/start":
+            return _post_interaction_live_start(body, live_asr_manager)
+        if method == "POST" and pure_path == "/interaction/live/chunk":
+            return _post_interaction_live_chunk(body, live_asr_manager)
+        if method == "GET" and pure_path == "/interaction/live/transcript":
+            return _get_interaction_live_transcript(query, live_asr_manager)
+        if method == "POST" and pure_path == "/interaction/live/abort":
+            return _post_interaction_live_abort(body, live_asr_manager)
         if method == "POST" and pure_path == "/voice/chat":
             return _post_voice_chat(body, dependencies, audio_dependencies)
         if method == "POST" and pure_path == "/voice/live/start":
@@ -224,6 +237,103 @@ def _get_interaction_session(
     )
 
 
+def _post_interaction_live_start(
+    body: Any,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    request = InteractionLiveStartRequest.from_dict(body or {})
+    _require_interaction_session_workflow(
+        request.interaction_session_id,
+        request.workflow,
+    )
+    manager = live_asr_manager or get_default_live_asr_manager()
+    live_session_id = manager.start_session(
+        request.sample_rate,
+        request.channels,
+        request.audio_format,
+    )
+    response = LiveVoiceStartResponse(
+        session_id=live_session_id,
+        sample_rate=request.sample_rate,
+        channels=request.channels,
+        audio_format=request.audio_format,
+    ).to_dict()
+    response.update(
+        {
+            "interaction_session_id": request.interaction_session_id,
+            "workflow": request.workflow,
+            "live_session_id": live_session_id,
+        }
+    )
+    return 200, response
+
+
+def _post_interaction_live_chunk(
+    body: Any,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    request = InteractionLiveChunkRequest.from_dict(body or {})
+    _require_interaction_session_workflow(
+        request.interaction_session_id,
+        request.workflow,
+    )
+    manager = live_asr_manager or get_default_live_asr_manager()
+    accepted_bytes = manager.submit_chunk(request.live_session_id, request.audio_bytes)
+    return 200, {
+        "ok": True,
+        "interaction_session_id": request.interaction_session_id,
+        "workflow": request.workflow,
+        "live_session_id": request.live_session_id,
+        "accepted_bytes": accepted_bytes,
+    }
+
+
+def _get_interaction_live_transcript(
+    query: str,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    parsed = parse_qs(query)
+    live_session_id = (
+        parsed.get("live_session_id")
+        or parsed.get("session_id")
+        or [""]
+    )[0]
+    interaction_session_id = (parsed.get("interaction_session_id") or [""])[0]
+    workflow = (parsed.get("workflow") or [""])[0]
+    if interaction_session_id or workflow:
+        _require_interaction_session_workflow(interaction_session_id, workflow)
+    manager = live_asr_manager or get_default_live_asr_manager()
+    state = manager.get_transcript(live_session_id)
+    return 200, {
+        "interaction_session_id": interaction_session_id,
+        "workflow": workflow,
+        "live_session_id": live_session_id,
+        "session_id": live_session_id,
+        "transcript": state.transcript,
+        "is_final": state.is_final,
+        "error": state.error,
+    }
+
+
+def _post_interaction_live_abort(
+    body: Any,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    request = InteractionLiveSessionRequest.from_dict(body or {})
+    _require_interaction_session_workflow(
+        request.interaction_session_id,
+        request.workflow,
+    )
+    manager = live_asr_manager or get_default_live_asr_manager()
+    manager.abort_session(request.live_session_id)
+    return 200, {
+        "ok": True,
+        "interaction_session_id": request.interaction_session_id,
+        "workflow": request.workflow,
+        "live_session_id": request.live_session_id,
+    }
+
+
 def _post_voice_chat(
     body: Any,
     dependencies: DialogueDependencies | None,
@@ -239,6 +349,20 @@ def _post_voice_chat(
         dialogue_dependencies=dependencies,
     )
     return 200, response.to_dict()
+
+
+def _require_interaction_session_workflow(
+    interaction_session_id: str,
+    workflow: str,
+) -> dict:
+    session = interaction_store.get_session(interaction_session_id)
+    if session["workflow"] != workflow:
+        raise ValueError(
+            f"interaction session workflow is {session['workflow']!r}, got {workflow!r}"
+        )
+    if session["status"] != interaction_store.SESSION_ACTIVE:
+        raise ValueError("interaction session must be active")
+    return session
 
 
 def _post_voice_live_start(
@@ -909,6 +1033,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             if urlsplit(self.path).path == "/interaction/runs/text-stream":
                 self._write_interaction_text_stream(body)
                 return
+            if urlsplit(self.path).path == "/interaction/live/finish-stream":
+                self._write_interaction_live_finish_stream(body)
+                return
             if urlsplit(self.path).path == "/voice/live/finish-stream":
                 self._write_voice_live_stream(body)
                 return
@@ -1052,6 +1179,73 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 event = item.get("event", "message")
                 data = item.get("data", {})
                 self._write_sse_event(event, data)
+        except Exception as exc:  # pragma: no cover - defensive network path
+            self._write_sse_event(
+                "error",
+                {"message": str(exc) or exc.__class__.__name__},
+            )
+
+    def _write_interaction_live_finish_stream(self, body: Any) -> None:
+        try:
+            request = InteractionLiveFinishStreamRequest.from_dict(body or {})
+            _require_interaction_session_workflow(
+                request.interaction_session_id,
+                request.workflow,
+            )
+        except (SchemaError, ValueError, InteractionSessionNotFoundError) as exc:
+            status = 404 if isinstance(exc, InteractionSessionNotFoundError) else 400
+            self._write_json(status, {"error": {"message": str(exc)}})
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        try:
+            manager = type(self).injected_live_asr_manager or get_default_live_asr_manager()
+            state = manager.finish_session(request.live_session_id)
+            if state.error:
+                raise ValueError(state.error)
+            transcript = state.transcript.strip()
+            if not transcript:
+                raise ValueError("speech recognition produced an empty transcript")
+
+            reply_events = iter(
+                _iter_dialogue_reply_stream_events(
+                    lambda: iter_text_interaction_events(
+                        interaction_session_id=request.interaction_session_id,
+                        workflow=request.workflow,
+                        message=transcript,
+                        dependencies=type(self).injected_dependencies,
+                        onboarding_dependencies=type(self).injected_onboarding_dependencies,
+                    ),
+                    transcript=transcript,
+                    tts_enabled=request.tts_enabled,
+                    audio_dependencies=type(self).injected_audio_dependencies,
+                )
+            )
+            first_item = next(reply_events)
+            first_data = dict(first_item.get("data") or {})
+            transcript_data = {
+                "workflow": request.workflow,
+                "interaction_session_id": request.interaction_session_id,
+                "run_id": first_data.get("run_id", ""),
+                "conversation_id": first_data.get("conversation_id", ""),
+                "onboarding_session_id": first_data.get("onboarding_session_id", ""),
+                "live_session_id": request.live_session_id,
+                "session_id": request.live_session_id,
+                "transcript": transcript,
+                "is_final": True,
+            }
+            self._write_sse_event("transcript", transcript_data)
+            self._write_sse_event(
+                first_item.get("event", "message"),
+                first_item.get("data", {}),
+            )
+            for item in reply_events:
+                self._write_sse_event(item.get("event", "message"), item.get("data", {}))
         except Exception as exc:  # pragma: no cover - defensive network path
             self._write_sse_event(
                 "error",
