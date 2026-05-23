@@ -24,6 +24,7 @@ from src.coordinator import request_coordinator
 from src.interaction import store as interaction_store
 from src.memory import db
 from src.services import DialogueDependencies, reset_followup_delivery_bus
+from src.services.onboarding_service import OnboardingDependencies
 
 
 class FakeConversationStore:
@@ -559,10 +560,12 @@ class _FakeStreamHandler:
         dependencies: DialogueDependencies,
         *,
         audio_dependencies: AudioDependencies | None = None,
+        onboarding_dependencies: OnboardingDependencies | None = None,
         path: str = "/chat/stream",
     ) -> None:
         type(self).injected_dependencies = dependencies
         type(self).injected_audio_dependencies = audio_dependencies
+        type(self).injected_onboarding_dependencies = onboarding_dependencies
         self.path = path
         self.status: int | None = None
         self.headers: list[tuple[str, str]] = []

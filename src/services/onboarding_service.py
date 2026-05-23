@@ -18,6 +18,7 @@ from src.agents.onboarding_agent import (
     normalize_onboarding_agent_result,
     run_onboarding_step,
 )
+from src.agents.onboarding_streaming_agent import generate_onboarding_reply_stream
 from src.onboarding import store as onboarding_store
 
 
@@ -112,6 +113,7 @@ SLOT_FOLLOWUP_QUESTIONS = {
 
 RunStep = Callable[..., dict]
 GenerateQuestion = Callable[..., str]
+GenerateReplyStream = Callable[..., Any]
 ReadModelProfile = Callable[[], str]
 AppendTurn = Callable[[str, dict], str]
 CreateSession = Callable[..., dict]
@@ -128,6 +130,7 @@ class OnboardingDependencies:
     update_session: UpdateSession | None = None
     run_step: RunStep | None = None
     generate_question: GenerateQuestion | None = None
+    generate_reply_stream: GenerateReplyStream | None = None
     read_model_profile: ReadModelProfile | None = None
     append_turn: AppendTurn | None = None
     model_client: Any | None = None
@@ -147,6 +150,8 @@ class OnboardingDependencies:
             deps = deps.with_overrides(run_step=run_onboarding_step)
         if deps.generate_question is None:
             deps = deps.with_overrides(generate_question=generate_onboarding_question)
+        if deps.generate_reply_stream is None:
+            deps = deps.with_overrides(generate_reply_stream=generate_onboarding_reply_stream)
         if deps.read_model_profile is None:
             from src.persona.file_manager import read_model_profile
 
@@ -207,19 +212,86 @@ def handle_onboarding_message(
         raise ValueError("message must be a non-empty string")
 
     deps = (dependencies or OnboardingDependencies()).resolved()
-    session = deps.get_session(session_id)
-    if session["status"] != SESSION_ACTIVE:
-        return _response_payload(
-            session,
-            reply="这次引导已经完成了，我们可以直接继续聊天。",
+    prepared = prepare_onboarding_step(
+        session_id,
+        message,
+        dependencies=deps,
+    )
+    if prepared["event"] == "stage_transition":
+        generated = _generate_stage_question(
+            deps,
+            stage=prepared["target_stage"],
+            collected=prepared["collected"],
+            turns=prepared["turns"],
+            model_profile=prepared["reply_input"].get("model_profile", ""),
+            transition_from_stage=prepared["stage"],
         )
+        prepared["reply_target"]["target_text"] = generated
+    return complete_onboarding_step(
+        prepared,
+        prepared["reply_target"]["target_text"],
+        dependencies=deps,
+    )
 
+
+def prepare_onboarding_step(
+    session_id: str,
+    message: str,
+    *,
+    dependencies: OnboardingDependencies | None = None,
+) -> dict:
+    """Run the non-streaming control step and return a pending reply plan."""
+
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id must be a non-empty string")
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("message must be a non-empty string")
+
+    deps = (dependencies or OnboardingDependencies()).resolved()
+    session = deps.get_session(session_id)
     stage_number = int(session["stage"])
     stage = _stage_by_number(stage_number)
+    if session["status"] != SESSION_ACTIVE:
+        reply_target = {
+            "kind": "already_completed",
+            "target_text": "这次引导已经完成了，我们可以直接继续聊天。",
+        }
+        turns = list(session.get("turns") or [])
+        collected = dict(session.get("collected") or {})
+        state = {
+            "session_id": session["session_id"],
+            "stage": stage,
+            "target_stage": stage,
+            "collected": collected,
+            "missing_required_slots": [],
+            "status_after_reply": session["status"],
+        }
+        return {
+            "session": session,
+            "turns": turns,
+            "stage": stage,
+            "target_stage": stage,
+            "target_stage_number": stage_number,
+            "event": "already_completed",
+            "collected": collected,
+            "final_payload": dict(session.get("final_payload") or {}),
+            "control_result": {},
+            "missing_required_slots": [],
+            "reply_target": reply_target,
+            "reply_input": {
+                "session_id": session["session_id"],
+                "user_message": message,
+                "model_profile": deps.read_model_profile(),
+                "turns": turns,
+                "state": state,
+                "control_result": {},
+                "reply_target": reply_target,
+            },
+        }
+
     turns = list(session.get("turns") or [])
     turns = _append_user_turn(deps, session, turns, message, stage=stage_number)
     model_profile = deps.read_model_profile()
-
     raw_result = deps.run_step(
         stage=stage_number,
         stage_goal=stage,
@@ -230,84 +302,162 @@ def handle_onboarding_message(
         model_client=deps.model_client,
     )
     result = normalize_onboarding_agent_result(raw_result)
+    prepared = apply_onboarding_control(
+        session=session,
+        turns=turns,
+        stage=stage,
+        control_result=result,
+        user_message=message,
+        model_profile=model_profile,
+    )
+    return prepared
 
-    collected = _merge_collected(session.get("collected") or {}, result["collected_patch"])
-    collected = _store_stage_summary(collected, stage, result.get("summary", ""))
+
+def apply_onboarding_control(
+    *,
+    session: dict,
+    turns: list[dict],
+    stage: dict,
+    control_result: dict,
+    user_message: str,
+    model_profile: str,
+) -> dict:
+    """Apply service-owned gates to the model control result."""
+
+    stage_number = int(stage["id"])
+    collected = _merge_collected(
+        session.get("collected") or {},
+        control_result["collected_patch"],
+    )
+    collected = _store_stage_summary(collected, stage, control_result.get("summary", ""))
     user_turn_count = _count_user_turns(turns, stage_number)
     missing_required_slots = _missing_required_slots(stage, collected)
     stage_complete = (
-        bool(result["stage_complete"])
+        bool(control_result["stage_complete"])
         and user_turn_count >= MIN_USER_TURNS_PER_STAGE
         and not missing_required_slots
     )
+    final_payload: dict = {}
 
     if not stage_complete:
-        reply = _followup_reply(stage, result, missing_required_slots)
-        turns = _append_assistant_turn(
-            deps,
-            session,
-            turns,
-            reply,
-            stage=stage_number,
-            event="followup",
-        )
-        session = deps.update_session(
-            session_id,
-            stage=stage_number,
-            collected=collected,
-            turns=turns,
-        )
-        return _response_payload(session, reply=reply)
+        target_stage_number = stage_number
+        target_stage = stage
+        event = "followup"
+        reply_target = {
+            "kind": "followup",
+            "target_text": _followup_reply(stage, control_result, missing_required_slots),
+            "missing_required_slots": missing_required_slots,
+        }
+    elif stage_number < len(ONBOARDING_STAGES):
+        target_stage_number = stage_number + 1
+        target_stage = _stage_by_number(target_stage_number)
+        event = "stage_transition"
+        reply_target = {
+            "kind": "stage_transition",
+            "target_text": control_result["next_question"] or target_stage["first_question"],
+            "from_stage": stage,
+            "to_stage": target_stage,
+        }
+    else:
+        target_stage_number = stage_number
+        target_stage = stage
+        event = "completed"
+        final_payload = _build_final_payload(collected)
+        reply_target = {
+            "kind": "completed",
+            "target_text": (
+                control_result["next_question"]
+                or "我已经了解得差不多了，以后聊天我会尽量记住这些。"
+            ),
+        }
 
-    if stage_number < len(ONBOARDING_STAGES):
-        next_stage_number = stage_number + 1
-        next_stage = _stage_by_number(next_stage_number)
-        reply = _generate_stage_question(
-            deps,
-            stage=next_stage,
-            collected=collected,
-            turns=turns,
-            model_profile=model_profile,
-            transition_from_stage=stage,
-        )
-        turns = _append_assistant_turn(
-            deps,
-            session,
-            turns,
-            reply,
-            stage=next_stage_number,
-            event="stage_transition",
-        )
-        session = deps.update_session(
-            session_id,
-            stage=next_stage_number,
-            collected=collected,
-            turns=turns,
-        )
-        return _response_payload(session, reply=reply)
+    state = {
+        "session_id": session["session_id"],
+        "stage": stage,
+        "target_stage": target_stage,
+        "collected": collected,
+        "missing_required_slots": missing_required_slots,
+        "status_after_reply": (
+            SESSION_COMPLETED if event == "completed" else SESSION_ACTIVE
+        ),
+    }
+    reply_input = {
+        "session_id": session["session_id"],
+        "user_message": user_message,
+        "model_profile": model_profile,
+        "turns": turns,
+        "state": state,
+        "control_result": control_result,
+        "reply_target": reply_target,
+    }
+    return {
+        "session": session,
+        "turns": turns,
+        "stage": stage,
+        "target_stage": target_stage,
+        "target_stage_number": target_stage_number,
+        "event": event,
+        "collected": collected,
+        "final_payload": final_payload,
+        "control_result": control_result,
+        "missing_required_slots": missing_required_slots,
+        "reply_target": reply_target,
+        "reply_input": reply_input,
+    }
 
-    final_payload = _build_final_payload(collected)
-    reply = result["next_question"] or "我已经了解得差不多了，以后聊天我会尽量记住这些。"
+
+def stream_onboarding_reply(
+    prepared_step: dict,
+    *,
+    dependencies: OnboardingDependencies | None = None,
+):
+    """Yield true streaming user-visible onboarding reply deltas."""
+
+    deps = (dependencies or OnboardingDependencies()).resolved()
+    yield from deps.generate_reply_stream(
+        prepared_step["reply_input"],
+        model_client=deps.model_client,
+    )
+
+
+def complete_onboarding_step(
+    prepared_step: dict,
+    reply: str,
+    *,
+    dependencies: OnboardingDependencies | None = None,
+) -> dict:
+    """Persist assistant reply and final onboarding state after streaming."""
+
+    if not isinstance(reply, str) or not reply.strip():
+        raise ValueError("reply must be a non-empty string")
+
+    deps = (dependencies or OnboardingDependencies()).resolved()
+    session = dict(prepared_step["session"])
+    if session["status"] != SESSION_ACTIVE:
+        return _response_payload(session, reply=reply.strip())
+
     turns = _append_assistant_turn(
         deps,
         session,
-        turns,
-        reply,
-        stage=stage_number,
-        event="completed",
+        list(prepared_step["turns"]),
+        reply.strip(),
+        stage=prepared_step["target_stage_number"],
+        event=prepared_step["event"],
     )
+    update_payload = {
+        "stage": prepared_step["target_stage_number"],
+        "collected": prepared_step["collected"],
+        "turns": turns,
+    }
+    if prepared_step["event"] == "completed":
+        update_payload["status"] = SESSION_COMPLETED
+        update_payload["final_payload"] = prepared_step["final_payload"]
+
     session = deps.update_session(
-        session_id,
-        status=SESSION_COMPLETED,
-        stage=stage_number,
-        collected=collected,
-        turns=turns,
-        final_payload=final_payload,
+        session["session_id"],
+        **update_payload,
     )
-    return _response_payload(
-        session,
-        reply=reply,
-    )
+    return _response_payload(session, reply=reply.strip())
 
 
 def get_onboarding_status(

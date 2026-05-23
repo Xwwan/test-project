@@ -8,8 +8,11 @@ from src.interaction import store as interaction_store
 from src.services.dialogue_service import DialogueDependencies, handle_chat_message_stream
 from src.services.onboarding_service import (
     OnboardingDependencies,
+    complete_onboarding_step,
     get_onboarding_status,
+    prepare_onboarding_step,
     start_onboarding,
+    stream_onboarding_reply,
 )
 
 
@@ -77,6 +80,7 @@ def iter_text_interaction_events(
     workflow: str,
     message: str,
     dependencies: DialogueDependencies | None = None,
+    onboarding_dependencies: OnboardingDependencies | None = None,
 ) -> Iterator[dict]:
     """Run one text interaction and yield normalized SSE event dictionaries."""
 
@@ -92,9 +96,12 @@ def iter_text_interaction_events(
         raise ValueError("interaction session must be active")
 
     if workflow == WORKFLOW_ONBOARDING:
-        raise NotImplementedError(
-            "onboarding text interaction streaming belongs to phase 2"
+        yield from _iter_onboarding_text_interaction_events(
+            session=session,
+            message=message,
+            dependencies=onboarding_dependencies,
         )
+        return
 
     yield from _iter_chat_text_interaction_events(
         session=session,
@@ -179,6 +186,110 @@ def _iter_chat_text_interaction_events(
             status=interaction_store.RUN_FAILED,
             error=str(exc) or exc.__class__.__name__,
             request_id=request_id,
+        )
+        raise
+
+
+def _iter_onboarding_text_interaction_events(
+    *,
+    session: dict,
+    message: str,
+    dependencies: OnboardingDependencies | None,
+) -> Iterator[dict]:
+    onboarding_session_id = session.get("onboarding_session_id") or ""
+    if not onboarding_session_id:
+        raise ValueError("interaction session is missing onboarding_session_id")
+
+    run = interaction_store.create_run(
+        interaction_session_id=session["interaction_session_id"],
+        workflow=WORKFLOW_ONBOARDING,
+        input_mode=INPUT_MODE_TEXT,
+        transcript=message,
+        onboarding_session_id=onboarding_session_id,
+    )
+    run_id = run["run_id"]
+    reply_parts: list[str] = []
+
+    try:
+        prepared = prepare_onboarding_step(
+            onboarding_session_id,
+            message,
+            dependencies=dependencies,
+        )
+        interaction_store.update_run(
+            run_id,
+            onboarding_session_id=onboarding_session_id,
+            stage=prepared["stage"]["id"],
+        )
+        yield {
+            "event": "meta",
+            "data": {
+                **_run_identity(session, run_id),
+                "onboarding_session_id": onboarding_session_id,
+                "stage": prepared["stage"]["id"],
+                "stage_key": prepared["stage"]["key"],
+                "stage_name": prepared["stage"]["name"],
+                "playback_key": f"onboarding-tts-{run_id}",
+            },
+        }
+
+        for delta in stream_onboarding_reply(prepared, dependencies=dependencies):
+            if not isinstance(delta, str):
+                raise TypeError("generate_reply_stream must yield strings")
+            if not delta:
+                continue
+            reply_parts.append(delta)
+            yield {
+                "event": "delta",
+                "data": {
+                    **_run_identity(session, run_id),
+                    "onboarding_session_id": onboarding_session_id,
+                    "delta": delta,
+                },
+            }
+
+        reply = "".join(reply_parts).strip()
+        if not reply:
+            raise ValueError("generate_reply_stream must produce a non-empty reply")
+        payload = complete_onboarding_step(
+            prepared,
+            reply,
+            dependencies=dependencies,
+        )
+        interaction_store.update_run(
+            run_id,
+            status=interaction_store.RUN_COMPLETED,
+            reply=reply,
+            onboarding_session_id=onboarding_session_id,
+            stage=payload["stage"],
+        )
+        yield {
+            "event": "state_delta",
+            "data": {
+                **_run_identity(session, run_id),
+                "onboarding_session_id": onboarding_session_id,
+                "stage": payload["stage"],
+                "stage_key": payload["stage_key"],
+                "stage_name": payload["stage_name"],
+                "status": payload["status"],
+                "missing_required_slots": payload["missing_required_slots"],
+                "onboarding_complete": payload["onboarding_complete"],
+            },
+        }
+        yield {
+            "event": "done",
+            "data": {
+                **payload,
+                **_run_identity(session, run_id),
+                "onboarding_session_id": onboarding_session_id,
+            },
+        }
+    except Exception as exc:
+        interaction_store.update_run(
+            run_id,
+            status=interaction_store.RUN_FAILED,
+            error=str(exc) or exc.__class__.__name__,
+            onboarding_session_id=onboarding_session_id,
         )
         raise
 

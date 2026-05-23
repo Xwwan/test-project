@@ -11,6 +11,7 @@ from src.agents.onboarding_agent import (
     normalize_onboarding_agent_result,
     run_onboarding_step,
 )
+from src.agents.onboarding_streaming_agent import generate_onboarding_reply_stream
 from src.models import OpenAIChatCompletionsClient
 from src.models import ChatResponse
 
@@ -23,6 +24,16 @@ class FakeModelClient:
     def chat(self, messages, **kwargs):
         self.calls.append({"messages": messages, "kwargs": kwargs})
         return ChatResponse(content=json.dumps(self.payload), raw={})
+
+
+class FakeStreamingModelClient:
+    def __init__(self, chunks: list[str]) -> None:
+        self.chunks = chunks
+        self.calls = []
+
+    def chat_stream(self, messages, **kwargs):
+        self.calls.append({"messages": messages, "kwargs": kwargs})
+        yield from self.chunks
 
 
 class OnboardingAgentTest(unittest.TestCase):
@@ -101,6 +112,34 @@ class OnboardingAgentTest(unittest.TestCase):
         user_prompt = client.calls[0]["messages"][1].content
         assert "Question Generation Input" in user_prompt
         assert "北京" in user_prompt
+
+    def test_generate_onboarding_reply_stream_yields_model_deltas(self):
+        client = FakeStreamingModelClient(["王叔，", "你住在哪儿？"])
+
+        chunks = list(
+            generate_onboarding_reply_stream(
+                {
+                    "model_profile": "你叫燕聆。",
+                    "turns": [{"role": "user", "content": "叫我王叔"}],
+                    "user_message": "叫我王叔",
+                    "state": {"stage": {"name": "认识你"}},
+                    "control_result": {
+                        "collected_patch": {"preferred_name": "王叔"},
+                    },
+                    "reply_target": {
+                        "kind": "followup",
+                        "target_text": "你住在哪儿？",
+                    },
+                },
+                model_client=client,
+            )
+        )
+
+        assert chunks == ["王叔，", "你住在哪儿？"]
+        assert client.calls
+        prompt = client.calls[0]["messages"][1].content
+        assert "Reply Target" in prompt
+        assert "你住在哪儿？" in prompt
 
     def test_build_deepseek_client_uses_official_api(self):
         with patch("src.agents.onboarding_agent.get_config_value", return_value="dk"):

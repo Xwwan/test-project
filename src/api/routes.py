@@ -60,6 +60,7 @@ from src.services import (
     iter_followup_events,
     refresh_user_profile,
 )
+from src.services.onboarding_service import OnboardingDependencies
 from src.services.reply_tags import prepare_tts_text
 from .schemas import (
     ChatRequest,
@@ -100,6 +101,7 @@ def dispatch(
     dependencies: DialogueDependencies | None = None,
     audio_dependencies: AudioDependencies | None = None,
     live_asr_manager: LiveAsrSessionManager | None = None,
+    onboarding_dependencies: OnboardingDependencies | None = None,
 ) -> JSONResponse:
     """Route one request to the right service function."""
 
@@ -116,12 +118,15 @@ def dispatch(
         if method == "POST" and pure_path == "/chat":
             return _post_chat(body, dependencies)
         if method == "POST" and pure_path == "/interaction/sessions":
-            return _post_interaction_session(body)
+            return _post_interaction_session(body, onboarding_dependencies)
         if method == "GET" and _INTERACTION_SESSION_PATTERN.match(pure_path):
             interaction_session_id = _INTERACTION_SESSION_PATTERN.match(pure_path)[
                 "interaction_session_id"
             ]
-            return _get_interaction_session(interaction_session_id)
+            return _get_interaction_session(
+                interaction_session_id,
+                onboarding_dependencies,
+            )
         if method == "POST" and pure_path == "/voice/chat":
             return _post_voice_chat(body, dependencies, audio_dependencies)
         if method == "POST" and pure_path == "/voice/live/start":
@@ -195,18 +200,28 @@ def _post_chat(body: Any, dependencies: DialogueDependencies | None) -> JSONResp
     return 200, response.to_dict()
 
 
-def _post_interaction_session(body: Any) -> JSONResponse:
+def _post_interaction_session(
+    body: Any,
+    onboarding_dependencies: OnboardingDependencies | None,
+) -> JSONResponse:
     request = InteractionSessionCreateRequest.from_dict(body or {})
     return 200, create_interaction_session(
         workflow=request.workflow,
         conversation_id=request.conversation_id,
         input_mode=request.input_mode,
         tts_enabled=request.tts_enabled,
+        onboarding_dependencies=onboarding_dependencies,
     )
 
 
-def _get_interaction_session(interaction_session_id: str) -> JSONResponse:
-    return 200, get_interaction_session_status(interaction_session_id)
+def _get_interaction_session(
+    interaction_session_id: str,
+    onboarding_dependencies: OnboardingDependencies | None,
+) -> JSONResponse:
+    return 200, get_interaction_session_status(
+        interaction_session_id,
+        onboarding_dependencies=onboarding_dependencies,
+    )
 
 
 def _post_voice_chat(
@@ -738,6 +753,10 @@ def _stream_audio_identity(data: dict) -> dict:
         "workflow",
         "interaction_session_id",
         "run_id",
+        "onboarding_session_id",
+        "stage",
+        "stage_key",
+        "stage_name",
         "playback_key",
     ):
         value = data.get(key)
@@ -838,6 +857,7 @@ def create_request_handler(
     dependencies: DialogueDependencies | None = None,
     audio_dependencies: AudioDependencies | None = None,
     live_asr_manager: LiveAsrSessionManager | None = None,
+    onboarding_dependencies: OnboardingDependencies | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Return a request handler class bound to ``dependencies``."""
 
@@ -845,6 +865,7 @@ def create_request_handler(
         injected_dependencies = dependencies
         injected_audio_dependencies = audio_dependencies
         injected_live_asr_manager = live_asr_manager
+        injected_onboarding_dependencies = onboarding_dependencies
 
     return _BoundHandler
 
@@ -855,6 +876,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
     injected_dependencies: DialogueDependencies | None = None
     injected_audio_dependencies: AudioDependencies | None = None
     injected_live_asr_manager: LiveAsrSessionManager | None = None
+    injected_onboarding_dependencies: OnboardingDependencies | None = None
     server_version = "ChatService/0.1"
 
     def do_GET(self) -> None:  # noqa: N802 - http.server naming
@@ -901,6 +923,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             dependencies=type(self).injected_dependencies,
             audio_dependencies=type(self).injected_audio_dependencies,
             live_asr_manager=type(self).injected_live_asr_manager,
+            onboarding_dependencies=type(self).injected_onboarding_dependencies,
         )
         self._write_json(status, response_body)
 
@@ -1021,6 +1044,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                     workflow=request.workflow,
                     message=request.message,
                     dependencies=type(self).injected_dependencies,
+                    onboarding_dependencies=type(self).injected_onboarding_dependencies,
                 ),
                 tts_enabled=request.tts_enabled,
                 audio_dependencies=type(self).injected_audio_dependencies,
