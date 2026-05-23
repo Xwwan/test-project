@@ -38,6 +38,13 @@ def _optional_bool(value: Any, field_name: str, default: bool) -> bool:
     return value
 
 
+def _workflow(value: Any) -> str:
+    workflow = _require_str(value, "workflow")
+    if workflow not in {"chat", "onboarding"}:
+        raise SchemaError("workflow must be one of {'chat', 'onboarding'}")
+    return workflow
+
+
 @dataclass
 class ChatRequest:
     conversation_id: str
@@ -66,6 +73,53 @@ class ChatResponse:
     reply: str
     retrieval_status: str
     retrieved_memory_ids: list[int] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class InteractionSessionCreateRequest:
+    workflow: str
+    conversation_id: str = ""
+    tts_enabled: bool = False
+    input_mode: str = "text"
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "InteractionSessionCreateRequest":
+        if not isinstance(data, dict):
+            raise SchemaError("interaction session request body must be a JSON object")
+        return cls(
+            workflow=_workflow(data.get("workflow")),
+            conversation_id=_optional_str(data.get("conversation_id"), "conversation_id"),
+            tts_enabled=_optional_bool(data.get("tts_enabled"), "tts_enabled", False),
+            input_mode=_optional_str(data.get("input_mode"), "input_mode") or "text",
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class InteractionTextStreamRequest:
+    interaction_session_id: str
+    workflow: str
+    message: str
+    tts_enabled: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "InteractionTextStreamRequest":
+        if not isinstance(data, dict):
+            raise SchemaError("interaction text stream request body must be a JSON object")
+        return cls(
+            interaction_session_id=_require_str(
+                data.get("interaction_session_id"),
+                "interaction_session_id",
+            ),
+            workflow=_workflow(data.get("workflow")),
+            message=_require_str(data.get("message"), "message"),
+            tts_enabled=_optional_bool(data.get("tts_enabled"), "tts_enabled", False),
+        )
 
     def to_dict(self) -> dict:
         return asdict(self)

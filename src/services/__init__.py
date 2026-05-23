@@ -18,15 +18,23 @@ from .memory_service import (
     curate_conversation_memory,
     refresh_user_profile,
 )
+from .interaction_service import (
+    create_interaction_session,
+    get_interaction_session_status,
+    iter_text_interaction_events,
+)
 
 __all__ = [
     "DialogueDependencies",
     "apply_operations",
+    "create_interaction_session",
     "curate_conversation_memory",
+    "get_interaction_session_status",
     "handle_chat_message",
     "handle_chat_message_stream",
     "handle_followup",
     "iter_followup_events",
+    "iter_text_interaction_events",
     "refresh_user_profile",
     "reset_followup_delivery_bus",
 ]

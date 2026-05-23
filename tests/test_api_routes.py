@@ -10,7 +10,9 @@ import base64
 import inspect
 import io
 import json
+import tempfile
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import unittest
@@ -19,6 +21,8 @@ from unittest.mock import patch
 from src.audio.service import AudioDependencies
 from src.api.routes import ChatRequestHandler, build_app, dispatch
 from src.coordinator import request_coordinator
+from src.interaction import store as interaction_store
+from src.memory import db
 from src.services import DialogueDependencies, reset_followup_delivery_bus
 
 
@@ -112,12 +116,16 @@ def _build_dependencies(
 
 class ApiRoutesTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        db.set_database_path(Path(self.temp_dir.name) / "app.db")
         request_coordinator.reset_store()
         reset_followup_delivery_bus()
 
     def tearDown(self) -> None:
         request_coordinator.reset_store()
         reset_followup_delivery_bus()
+        db.reset_database_path()
+        self.temp_dir.cleanup()
 
     def test_post_chat_returns_200_with_chat_response(self) -> None:
         deps, _, _ = _build_dependencies(initial_reply="你好，小明！")
@@ -190,6 +198,118 @@ class ApiRoutesTest(unittest.TestCase):
         assert events[-1]["data"]["audio_base64"] is None
         assert events[-1]["data"]["audio_format"] == "pcm"
         assert "transcript" not in events[-1]["data"]
+
+    def test_post_interaction_session_creates_chat_session(self) -> None:
+        status, body = dispatch(
+            "POST",
+            "/interaction/sessions",
+            {
+                "workflow": "chat",
+                "conversation_id": "conv-1",
+                "input_mode": "text",
+                "tts_enabled": True,
+            },
+        )
+
+        assert status == 200
+        assert body["workflow"] == "chat"
+        assert body["conversation_id"] == "conv-1"
+        assert body["status"] == "active"
+        assert body["input_mode"] == "text"
+        assert body["tts_enabled"] is True
+        assert body["interaction_session_id"].startswith("isess_")
+
+    def test_get_interaction_session_returns_status(self) -> None:
+        created = interaction_store.create_session(
+            workflow="chat",
+            conversation_id="conv-1",
+            input_mode="text",
+        )
+
+        status, body = dispatch(
+            "GET",
+            f"/interaction/sessions/{created['interaction_session_id']}",
+        )
+
+        assert status == 200
+        assert body["interaction_session_id"] == created["interaction_session_id"]
+        assert body["workflow"] == "chat"
+        assert body["conversation_id"] == "conv-1"
+
+    def test_interaction_text_stream_wraps_chat_workflow(self) -> None:
+        deps, _, _ = _build_dependencies(initial_reply="统一入口")
+        created = interaction_store.create_session(
+            workflow="chat",
+            conversation_id="conv-1",
+            input_mode="text",
+        )
+        handler = _FakeStreamHandler(
+            deps,
+            path="/interaction/runs/text-stream",
+        )
+
+        ChatRequestHandler._write_interaction_text_stream(
+            handler,
+            {
+                "interaction_session_id": created["interaction_session_id"],
+                "workflow": "chat",
+                "message": "你好",
+            },
+        )
+
+        events = _parse_sse_events(handler.wfile.getvalue().decode("utf-8"))
+        assert [event["event"] for event in events] == ["meta", "delta", "done"]
+        assert events[0]["data"]["workflow"] == "chat"
+        assert events[0]["data"]["interaction_session_id"] == created["interaction_session_id"]
+        assert events[0]["data"]["run_id"].startswith("irun_")
+        assert events[1]["data"]["delta"] == "统一入口"
+        assert events[1]["data"]["workflow"] == "chat"
+        assert events[2]["data"]["reply"] == "统一入口"
+        assert events[2]["data"]["retrieval_status"] == "pending"
+
+        run = interaction_store.get_run(events[0]["data"]["run_id"])
+        assert run["status"] == "completed"
+        assert run["reply"] == "统一入口"
+        assert run["transcript"] == "你好"
+
+    def test_interaction_text_stream_yields_audio_identity(self) -> None:
+        deps, _, _ = _build_dependencies(initial_reply="你好。")
+        created = interaction_store.create_session(
+            workflow="chat",
+            conversation_id="conv-1",
+            input_mode="text",
+        )
+        tts = FakeStreamingTts([b"audio"])
+        handler = _FakeStreamHandler(
+            deps,
+            audio_dependencies=AudioDependencies(tts_client=tts),
+            path="/interaction/runs/text-stream",
+        )
+
+        ChatRequestHandler._write_interaction_text_stream(
+            handler,
+            {
+                "interaction_session_id": created["interaction_session_id"],
+                "workflow": "chat",
+                "message": "你好",
+                "tts_enabled": True,
+            },
+        )
+
+        events = _parse_sse_events(handler.wfile.getvalue().decode("utf-8"))
+        assert [event["event"] for event in events] == [
+            "meta",
+            "delta",
+            "audio",
+            "done",
+        ]
+        assert events[2]["data"]["workflow"] == "chat"
+        assert events[2]["data"]["interaction_session_id"] == created["interaction_session_id"]
+        assert events[2]["data"]["run_id"] == events[0]["data"]["run_id"]
+        assert events[2]["data"]["playback_key"] == f"chat-tts-{events[0]['data']['run_id']}"
+        assert events[2]["data"]["audio_base64"] == base64.b64encode(b"audio").decode(
+            "ascii"
+        )
 
     def test_followups_stream_yields_audio_when_tts_enabled(self) -> None:
         deps, _, _ = _build_dependencies()

@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, urlsplit
 
 from src.coordinator import RequestNotFoundError, RequestStateError, get_pending_followup_requests
+from src.interaction.store import InteractionSessionNotFoundError
 from src.audio.live_asr import (
     LiveAsrSessionManager,
     LiveAsrSessionNotFoundError,
@@ -53,6 +54,9 @@ from src.services import (
     handle_chat_message,
     handle_chat_message_stream,
     handle_followup,
+    create_interaction_session,
+    get_interaction_session_status,
+    iter_text_interaction_events,
     iter_followup_events,
     refresh_user_profile,
 )
@@ -61,6 +65,8 @@ from .schemas import (
     ChatRequest,
     ChatResponse,
     FollowupDecisionResponse,
+    InteractionSessionCreateRequest,
+    InteractionTextStreamRequest,
     MemoryCurateRequest,
     MemoryCurateResponse,
     ProfileRefreshResponse,
@@ -75,6 +81,9 @@ logger = logging.getLogger("chat-service.api")
 
 
 _FOLLOWUP_RUN_PATTERN = re.compile(r"^/followups/(?P<request_id>[^/]+)/run$")
+_INTERACTION_SESSION_PATTERN = re.compile(
+    r"^/interaction/sessions/(?P<interaction_session_id>[^/]+)$"
+)
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _VOICE_LATENCY_PAGE = _STATIC_DIR / "voice_latency.html"
 _TTS_SENTINEL = object()
@@ -106,6 +115,13 @@ def dispatch(
     try:
         if method == "POST" and pure_path == "/chat":
             return _post_chat(body, dependencies)
+        if method == "POST" and pure_path == "/interaction/sessions":
+            return _post_interaction_session(body)
+        if method == "GET" and _INTERACTION_SESSION_PATTERN.match(pure_path):
+            interaction_session_id = _INTERACTION_SESSION_PATTERN.match(pure_path)[
+                "interaction_session_id"
+            ]
+            return _get_interaction_session(interaction_session_id)
         if method == "POST" and pure_path == "/voice/chat":
             return _post_voice_chat(body, dependencies, audio_dependencies)
         if method == "POST" and pure_path == "/voice/live/start":
@@ -144,6 +160,8 @@ def dispatch(
         return _error(400, str(exc))
     except LiveAsrSessionNotFoundError as exc:
         return _error(404, str(exc))
+    except InteractionSessionNotFoundError as exc:
+        return _error(404, str(exc))
     except RequestNotFoundError as exc:
         return _error(404, str(exc))
     except RequestStateError as exc:
@@ -175,6 +193,20 @@ def _post_chat(body: Any, dependencies: DialogueDependencies | None) -> JSONResp
         retrieved_memory_ids=payload.get("retrieved_memory_ids", []),
     )
     return 200, response.to_dict()
+
+
+def _post_interaction_session(body: Any) -> JSONResponse:
+    request = InteractionSessionCreateRequest.from_dict(body or {})
+    return 200, create_interaction_session(
+        workflow=request.workflow,
+        conversation_id=request.conversation_id,
+        input_mode=request.input_mode,
+        tts_enabled=request.tts_enabled,
+    )
+
+
+def _get_interaction_session(interaction_session_id: str) -> JSONResponse:
+    return 200, get_interaction_session_status(interaction_session_id)
 
 
 def _post_voice_chat(
@@ -567,12 +599,7 @@ def _iter_dialogue_reply_stream_events(
             for item in chat_events_factory():
                 if item.get("event") == "meta":
                     data = item.get("data", {})
-                    audio_identity_holder["data"] = {
-                        "conversation_id": data.get("conversation_id", ""),
-                        "request_id": data.get("request_id", ""),
-                        "turn_id": data.get("turn_id", ""),
-                        "phase": "initial",
-                    }
+                    audio_identity_holder["data"] = _stream_audio_identity(data)
                     output_queue.put(item)
                     continue
 
@@ -587,12 +614,7 @@ def _iter_dialogue_reply_stream_events(
                 if item.get("event") == "done":
                     data = item.get("data", {})
                     if "data" not in audio_identity_holder:
-                        audio_identity_holder["data"] = {
-                            "conversation_id": data.get("conversation_id", ""),
-                            "request_id": data.get("request_id", ""),
-                            "turn_id": data.get("turn_id", ""),
-                            "phase": "initial",
-                        }
+                        audio_identity_holder["data"] = _stream_audio_identity(data)
                     for segment in segmenter.flush():
                         enqueue_tts_segment(segment)
                     done_holder["event"] = _dialogue_done_event(
@@ -703,6 +725,25 @@ def _dialogue_done_event(
         data["audio_base64"] = None
         data["audio_format"] = "pcm"
     return {"event": "done", "data": data}
+
+
+def _stream_audio_identity(data: dict) -> dict:
+    identity = {
+        "conversation_id": data.get("conversation_id", ""),
+        "request_id": data.get("request_id", ""),
+        "turn_id": data.get("turn_id", ""),
+        "phase": "initial",
+    }
+    for key in (
+        "workflow",
+        "interaction_session_id",
+        "run_id",
+        "playback_key",
+    ):
+        value = data.get(key)
+        if value:
+            identity[key] = value
+    return identity
 
 
 class _StreamingTtsSegmenter:
@@ -843,6 +884,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             if urlsplit(self.path).path == "/chat/stream":
                 self._write_chat_stream(body)
                 return
+            if urlsplit(self.path).path == "/interaction/runs/text-stream":
+                self._write_interaction_text_stream(body)
+                return
             if urlsplit(self.path).path == "/voice/live/finish-stream":
                 self._write_voice_live_stream(body)
                 return
@@ -951,6 +995,39 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 "followup stream client disconnected conversation_id=%s",
                 conversation_id,
             )
+        except Exception as exc:  # pragma: no cover - defensive network path
+            self._write_sse_event(
+                "error",
+                {"message": str(exc) or exc.__class__.__name__},
+            )
+
+    def _write_interaction_text_stream(self, body: Any) -> None:
+        try:
+            request = InteractionTextStreamRequest.from_dict(body or {})
+        except SchemaError as exc:
+            self._write_json(400, {"error": {"message": str(exc)}})
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        try:
+            for item in _iter_dialogue_reply_stream_events(
+                lambda: iter_text_interaction_events(
+                    interaction_session_id=request.interaction_session_id,
+                    workflow=request.workflow,
+                    message=request.message,
+                    dependencies=type(self).injected_dependencies,
+                ),
+                tts_enabled=request.tts_enabled,
+                audio_dependencies=type(self).injected_audio_dependencies,
+            ):
+                event = item.get("event", "message")
+                data = item.get("data", {})
+                self._write_sse_event(event, data)
         except Exception as exc:  # pragma: no cover - defensive network path
             self._write_sse_event(
                 "error",
