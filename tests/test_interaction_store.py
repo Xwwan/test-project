@@ -58,12 +58,43 @@ class InteractionStoreTest(unittest.TestCase):
             status="completed",
             reply="你好呀",
             request_id="req_1",
+            playback_key="chat-tts-irun-test",
+            playback_status="done",
         )
 
         assert updated["status"] == "completed"
         assert updated["reply"] == "你好呀"
         assert updated["request_id"] == "req_1"
+        assert updated["playback_key"] == "chat-tts-irun-test"
+        assert updated["playback_status"] == "done"
         assert updated["completed_at"]
+
+    def test_list_runs_for_session_returns_recent_runs(self):
+        first_session = store.create_session(workflow="chat", conversation_id="conv-1")
+        second_session = store.create_session(workflow="onboarding", conversation_id="conv-2")
+        first = store.create_run(
+            interaction_session_id=first_session["interaction_session_id"],
+            workflow="chat",
+            transcript="first",
+        )
+        second = store.create_run(
+            interaction_session_id=first_session["interaction_session_id"],
+            workflow="chat",
+            transcript="second",
+        )
+        store.create_run(
+            interaction_session_id=second_session["interaction_session_id"],
+            workflow="onboarding",
+            transcript="other",
+        )
+
+        runs = store.list_runs_for_session(first_session["interaction_session_id"])
+
+        assert [run["run_id"] for run in runs] == [
+            first["run_id"],
+            second["run_id"],
+        ]
+        assert [run["transcript"] for run in runs] == ["first", "second"]
 
     def test_missing_session_raises_not_found(self):
         with self.assertRaises(store.InteractionSessionNotFoundError):

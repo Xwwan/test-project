@@ -135,14 +135,19 @@ def _iter_chat_text_interaction_events(
             data = dict(item.get("data") or {})
             if event == "meta":
                 request_id = str(data.get("request_id") or "")
+                playback_key = f"chat-tts-{run_id}"
                 if request_id:
-                    interaction_store.update_run(run_id, request_id=request_id)
+                    interaction_store.update_run(
+                        run_id,
+                        request_id=request_id,
+                        playback_key=playback_key,
+                    )
                 yield {
                     "event": "meta",
                     "data": {
                         **data,
                         **_run_identity(session, run_id),
-                        "playback_key": f"chat-tts-{run_id}",
+                        "playback_key": playback_key,
                     },
                 }
                 continue
@@ -220,6 +225,7 @@ def _iter_onboarding_text_interaction_events(
             run_id,
             onboarding_session_id=onboarding_session_id,
             stage=prepared["stage"]["id"],
+            playback_key=f"onboarding-tts-{run_id}",
         )
         yield {
             "event": "meta",

@@ -11,6 +11,18 @@
 
 | Method | Path | 描述 |
 | --- | --- | --- |
+| `POST` | `/interaction/sessions` | 创建统一交互 session，按 `workflow` 初始化 chat 或 onboarding |
+| `GET` | `/interaction/sessions/{interaction_session_id}` | 查询统一交互 session 状态 |
+| `GET` | `/interaction/sessions/{interaction_session_id}/runs` | 查询某个 interaction session 下的 run 列表 |
+| `GET` | `/interaction/runs/{run_id}` | 查询单个 interaction run 的调试状态 |
+| `POST` | `/interaction/runs/text-stream` | 以 SSE 运行一轮文本 interaction |
+| `POST` | `/interaction/live/start` | 在 interaction session 下开始实时语音识别 |
+| `POST` | `/interaction/live/chunk` | 向 interaction live ASR 会话提交音频分块 |
+| `GET` | `/interaction/live/transcript` | 查询 interaction live ASR 最新字幕 |
+| `POST` | `/interaction/live/finish-stream` | 结束 live ASR，并按 `workflow` 分流为 interaction SSE |
+| `POST` | `/interaction/live/abort` | 中止 interaction live ASR 会话 |
+| `POST` | `/interaction/playback/done` | 标记某个 run 的播放任务完成 |
+| `POST` | `/interaction/playback/error` | 标记某个 run 的播放任务失败 |
 | `POST` | `/chat` | 处理一条用户消息，返回首条回复 |
 | `POST` | `/chat/stream` | 处理一条用户消息，以 SSE 流式返回首条回复 |
 | `POST` | `/voice/chat` | 处理一段用户语音，返回识别文本、首条回复和可选语音 |
@@ -43,7 +55,322 @@
 
 ---
 
-## 2. `POST /chat`
+## 2. 统一 Interaction API
+
+统一 interaction API 是新前端和自动语音应优先使用的入口。`workflow` 用于明确业务链路：
+
+- `chat`：普通聊天，保留记忆检索、retrieval pending 和 follow-up。
+- `onboarding`：五阶段引导，只推进 onboarding session，不创建 chat request，不触发记忆检索或 follow-up。
+
+### 2.1 `POST /interaction/sessions`
+
+请求：
+
+```json
+{
+  "workflow": "chat | onboarding",
+  "conversation_id": "reachy-mini-voice",
+  "input_mode": "text | local | robot | auto",
+  "tts_enabled": true
+}
+```
+
+响应：
+
+```json
+{
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "onboarding",
+  "conversation_id": "reachy-mini-voice",
+  "onboarding_session_id": "onb_<uuid4_hex>",
+  "stage": 1,
+  "stage_key": "greeting",
+  "stage_name": "认识你",
+  "status": "active",
+  "input_mode": "text",
+  "onboarding_complete": false,
+  "collected": {},
+  "missing_required_slots": []
+}
+```
+
+约定：
+
+- `workflow=chat` 不返回 onboarding 字段。
+- `workflow=onboarding` 会同时创建 onboarding session，并返回首阶段状态。
+- `input_mode` 只描述输入来源，不决定业务链路。
+
+### 2.2 `GET /interaction/sessions/{interaction_session_id}`
+
+返回统一 session 状态。若 session 绑定 onboarding，会附带当前阶段、缺失字段和完成状态。
+
+### 2.3 `GET /interaction/sessions/{interaction_session_id}/runs`
+
+可选 query：
+
+```text
+limit=50
+```
+
+响应：
+
+```json
+{
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "runs": [
+    {
+      "run_id": "irun_<uuid4_hex>",
+      "interaction_session_id": "isess_<uuid4_hex>",
+      "workflow": "chat",
+      "input_mode": "text",
+      "transcript": "你好",
+      "reply": "你好呀",
+      "status": "completed",
+      "error": "",
+      "request_id": "req_<uuid4_hex>",
+      "onboarding_session_id": "",
+      "stage": null,
+      "playback_key": "chat-tts-irun_xxx",
+      "playback_status": "idle | done | error",
+      "playback_error": "",
+      "created_at": "ISO 8601",
+      "updated_at": "ISO 8601",
+      "completed_at": "ISO 8601 | null"
+    }
+  ]
+}
+```
+
+### 2.4 `GET /interaction/runs/{run_id}`
+
+返回单个 run，字段同上。该接口用于调试面板、播放状态追踪和失败排查。
+
+### 2.5 `POST /interaction/runs/text-stream`
+
+请求：
+
+```json
+{
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "chat | onboarding",
+  "message": "用户文本",
+  "tts_enabled": true
+}
+```
+
+响应为 `text/event-stream; charset=utf-8`。
+
+`workflow=chat` 事件：
+
+```text
+meta
+delta
+audio        # tts_enabled=true 时可能出现
+done
+```
+
+`workflow=onboarding` 事件：
+
+```text
+meta
+delta
+audio        # tts_enabled=true 时可能出现
+state_delta
+done
+```
+
+约定：
+
+- `delta` 来自真实模型流式输出。
+- `audio` 事件带 `playback_key`、`run_id`、`interaction_session_id` 和 `workflow`。
+- `chat` 的 `done` 带 `request_id` 与 `retrieval_status=pending`。
+- `onboarding` 的 `done` 带 `onboarding_session_id`、`stage`、`stage_name`、`collected`、`missing_required_slots` 和 `onboarding_complete`，不带 `request_id` / `retrieval_status`。
+
+### 2.6 `POST /interaction/live/start`
+
+请求：
+
+```json
+{
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "chat | onboarding",
+  "sample_rate": 16000,
+  "channels": 1,
+  "audio_format": "pcm"
+}
+```
+
+响应：
+
+```json
+{
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "chat",
+  "live_session_id": "live_<uuid4_hex>",
+  "session_id": "live_<uuid4_hex>",
+  "sample_rate": 16000,
+  "channels": 1,
+  "audio_format": "pcm",
+  "chunk_duration_ms": 160,
+  "chunk_bytes": 5120
+}
+```
+
+### 2.7 `POST /interaction/live/chunk`
+
+请求：
+
+```json
+{
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "chat | onboarding",
+  "live_session_id": "live_<uuid4_hex>",
+  "audio_base64": "base64 encoded PCM chunk",
+  "is_final": false
+}
+```
+
+响应：
+
+```json
+{
+  "ok": true,
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "chat",
+  "live_session_id": "live_<uuid4_hex>",
+  "accepted_bytes": 5120
+}
+```
+
+### 2.8 `GET /interaction/live/transcript`
+
+query：
+
+```text
+interaction_session_id=isess_xxx&workflow=chat&live_session_id=live_xxx
+```
+
+响应：
+
+```json
+{
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "chat",
+  "live_session_id": "live_<uuid4_hex>",
+  "session_id": "live_<uuid4_hex>",
+  "transcript": "实时字幕",
+  "is_final": false,
+  "error": null
+}
+```
+
+### 2.9 `POST /interaction/live/finish-stream`
+
+请求：
+
+```json
+{
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "chat | onboarding",
+  "live_session_id": "live_<uuid4_hex>",
+  "tts_enabled": true
+}
+```
+
+响应为 SSE。服务端先完成 ASR，然后把最终 `transcript` 作为本轮 interaction message：
+
+```text
+event: transcript
+data: {"workflow":"chat","interaction_session_id":"isess_xxx","run_id":"irun_xxx","live_session_id":"live_xxx","transcript":"最终文本","is_final":true}
+
+event: meta
+data: {"workflow":"chat","interaction_session_id":"isess_xxx","run_id":"irun_xxx", ...}
+
+event: delta
+data: {"workflow":"chat","interaction_session_id":"isess_xxx","run_id":"irun_xxx","delta":"回复片段"}
+
+event: done
+data: {"workflow":"chat","interaction_session_id":"isess_xxx","run_id":"irun_xxx","transcript":"最终文本", ...}
+```
+
+约定：
+
+- `workflow=chat` 进入普通聊天，会创建 `request_id` 并触发后台 retrieval。
+- `workflow=onboarding` 进入 onboarding，不创建 `request_id`，不触发 retrieval/follow-up。
+- `tts_enabled=true` 时，`audio` 事件与文本流并发输出。
+
+### 2.10 `POST /interaction/live/abort`
+
+请求：
+
+```json
+{
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "chat | onboarding",
+  "live_session_id": "live_<uuid4_hex>"
+}
+```
+
+响应：
+
+```json
+{
+  "ok": true,
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "chat",
+  "live_session_id": "live_<uuid4_hex>"
+}
+```
+
+### 2.11 `POST /interaction/playback/done`
+
+请求：
+
+```json
+{
+  "run_id": "irun_<uuid4_hex>",
+  "playback_key": "chat-tts-irun_xxx"
+}
+```
+
+响应：
+
+```json
+{
+  "ok": true,
+  "run_id": "irun_<uuid4_hex>",
+  "playback_key": "chat-tts-irun_xxx",
+  "playback_status": "done"
+}
+```
+
+### 2.12 `POST /interaction/playback/error`
+
+请求：
+
+```json
+{
+  "run_id": "irun_<uuid4_hex>",
+  "playback_key": "chat-tts-irun_xxx",
+  "error": "speaker unavailable"
+}
+```
+
+响应：
+
+```json
+{
+  "ok": true,
+  "run_id": "irun_<uuid4_hex>",
+  "playback_key": "chat-tts-irun_xxx",
+  "playback_status": "error",
+  "playback_error": "speaker unavailable"
+}
+```
+
+---
+
+## 3. `POST /chat`
 
 请求：
 
@@ -77,7 +404,7 @@
 
 ---
 
-## 3. `POST /chat/stream`
+## 4. `POST /chat/stream`
 
 请求与 `/chat` 基本相同，可选开启 TTS：
 
@@ -142,7 +469,7 @@ data: {"message":"human readable reason"}
 
 ---
 
-## 4. `POST /voice/chat`
+## 5. `POST /voice/chat`
 
 请求：
 
@@ -179,7 +506,7 @@ data: {"message":"human readable reason"}
 
 ---
 
-## 5. 实时语音接口
+## 6. 实时语音接口
 
 实时语音接口面向 Reachy app 一类的外部采集端：采集端负责录音、降采样和分块；
 `test-project` 负责持有火山 ASR WebSocket、维护实时字幕，并按结束接口决定只返回
@@ -408,7 +735,7 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 
 ---
 
-## 6. `GET /followups/pending`
+## 7. `GET /followups/pending`
 
 响应：
 
@@ -427,7 +754,7 @@ data: {"request_id":"req_<uuid4_hex>","turn_id":"turn_<uuid4_hex>","conversation
 
 ---
 
-## 7. `GET /followups/stream?conversation_id=...`
+## 8. `GET /followups/stream?conversation_id=...`
 
 请求 query：
 
@@ -470,7 +797,7 @@ data: {"conversation_id":"string","request_id":"req_xxx","turn_id":"turn_xxx","f
 
 ---
 
-## 8. `POST /followups/{request_id}/run`
+## 9. `POST /followups/{request_id}/run`
 
 请求体可省略或为 `{}`。
 
@@ -495,7 +822,7 @@ data: {"conversation_id":"string","request_id":"req_xxx","turn_id":"turn_xxx","f
 
 ---
 
-## 9. `POST /memory/curate`
+## 10. `POST /memory/curate`
 
 请求：
 
@@ -530,7 +857,7 @@ data: {"conversation_id":"string","request_id":"req_xxx","turn_id":"turn_xxx","f
 
 ---
 
-## 10. Memory Curator 输出 schema
+## 11. Memory Curator 输出 schema
 
 参考 `docs/tasks/person-3-orchestration-curator.md` 第 5.3 节。Person 3
 归一化后保证：
@@ -567,7 +894,7 @@ data: {"conversation_id":"string","request_id":"req_xxx","turn_id":"turn_xxx","f
 
 ---
 
-## 11. `POST /memory/profile/refresh`
+## 12. `POST /memory/profile/refresh`
 
 请求体为空 `{}`。
 
@@ -595,7 +922,7 @@ data: {"conversation_id":"string","request_id":"req_xxx","turn_id":"turn_xxx","f
 
 ---
 
-## 12. Request Coordinator 内部状态机
+## 13. Request Coordinator 内部状态机
 
 ```
 received
@@ -611,7 +938,7 @@ failed                          (任意阶段失败)
 
 ---
 
-## 13. Dialogue Service 对 Person 1 / Person 2 的依赖
+## 14. Dialogue Service 对 Person 1 / Person 2 的依赖
 
 所有依赖通过 `DialogueDependencies` 注入，包括但不限于：
 

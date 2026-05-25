@@ -28,7 +28,10 @@ from urllib.parse import parse_qs, urlsplit
 
 from src.coordinator import RequestNotFoundError, RequestStateError, get_pending_followup_requests
 from src.interaction import store as interaction_store
-from src.interaction.store import InteractionSessionNotFoundError
+from src.interaction.store import (
+    InteractionRunNotFoundError,
+    InteractionSessionNotFoundError,
+)
 from src.audio.live_asr import (
     LiveAsrSessionManager,
     LiveAsrSessionNotFoundError,
@@ -72,6 +75,7 @@ from .schemas import (
     InteractionLiveFinishStreamRequest,
     InteractionLiveSessionRequest,
     InteractionLiveStartRequest,
+    InteractionPlaybackRequest,
     InteractionTextStreamRequest,
     MemoryCurateRequest,
     MemoryCurateResponse,
@@ -90,6 +94,10 @@ _FOLLOWUP_RUN_PATTERN = re.compile(r"^/followups/(?P<request_id>[^/]+)/run$")
 _INTERACTION_SESSION_PATTERN = re.compile(
     r"^/interaction/sessions/(?P<interaction_session_id>[^/]+)$"
 )
+_INTERACTION_SESSION_RUNS_PATTERN = re.compile(
+    r"^/interaction/sessions/(?P<interaction_session_id>[^/]+)/runs$"
+)
+_INTERACTION_RUN_PATTERN = re.compile(r"^/interaction/runs/(?P<run_id>[^/]+)$")
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _VOICE_LATENCY_PAGE = _STATIC_DIR / "voice_latency.html"
 _TTS_SENTINEL = object()
@@ -124,6 +132,11 @@ def dispatch(
             return _post_chat(body, dependencies)
         if method == "POST" and pure_path == "/interaction/sessions":
             return _post_interaction_session(body, onboarding_dependencies)
+        if method == "GET" and _INTERACTION_SESSION_RUNS_PATTERN.match(pure_path):
+            interaction_session_id = _INTERACTION_SESSION_RUNS_PATTERN.match(pure_path)[
+                "interaction_session_id"
+            ]
+            return _get_interaction_session_runs(interaction_session_id, query)
         if method == "GET" and _INTERACTION_SESSION_PATTERN.match(pure_path):
             interaction_session_id = _INTERACTION_SESSION_PATTERN.match(pure_path)[
                 "interaction_session_id"
@@ -132,6 +145,13 @@ def dispatch(
                 interaction_session_id,
                 onboarding_dependencies,
             )
+        if method == "GET" and _INTERACTION_RUN_PATTERN.match(pure_path):
+            run_id = _INTERACTION_RUN_PATTERN.match(pure_path)["run_id"]
+            return _get_interaction_run(run_id)
+        if method == "POST" and pure_path == "/interaction/playback/done":
+            return _post_interaction_playback_done(body)
+        if method == "POST" and pure_path == "/interaction/playback/error":
+            return _post_interaction_playback_error(body)
         if method == "POST" and pure_path == "/interaction/live/start":
             return _post_interaction_live_start(body, live_asr_manager)
         if method == "POST" and pure_path == "/interaction/live/chunk":
@@ -179,6 +199,8 @@ def dispatch(
     except LiveAsrSessionNotFoundError as exc:
         return _error(404, str(exc))
     except InteractionSessionNotFoundError as exc:
+        return _error(404, str(exc))
+    except InteractionRunNotFoundError as exc:
         return _error(404, str(exc))
     except RequestNotFoundError as exc:
         return _error(404, str(exc))
@@ -235,6 +257,56 @@ def _get_interaction_session(
         interaction_session_id,
         onboarding_dependencies=onboarding_dependencies,
     )
+
+
+def _get_interaction_session_runs(
+    interaction_session_id: str,
+    query: str,
+) -> JSONResponse:
+    parsed = parse_qs(query)
+    limit = int((parsed.get("limit") or ["50"])[0])
+    runs = interaction_store.list_runs_for_session(interaction_session_id, limit=limit)
+    return 200, {
+        "interaction_session_id": interaction_session_id,
+        "runs": runs,
+    }
+
+
+def _get_interaction_run(run_id: str) -> JSONResponse:
+    return 200, interaction_store.get_run(run_id)
+
+
+def _post_interaction_playback_done(body: Any) -> JSONResponse:
+    request = InteractionPlaybackRequest.from_dict(body or {})
+    run = interaction_store.update_run(
+        request.run_id,
+        playback_key=request.playback_key,
+        playback_status=interaction_store.PLAYBACK_DONE,
+        playback_error="",
+    )
+    return 200, {
+        "ok": True,
+        "run_id": run["run_id"],
+        "playback_key": run["playback_key"],
+        "playback_status": run["playback_status"],
+    }
+
+
+def _post_interaction_playback_error(body: Any) -> JSONResponse:
+    request = InteractionPlaybackRequest.from_dict(body or {})
+    run = interaction_store.update_run(
+        request.run_id,
+        playback_key=request.playback_key,
+        playback_status=interaction_store.PLAYBACK_ERROR,
+        playback_error=request.error,
+    )
+    return 200, {
+        "ok": True,
+        "run_id": run["run_id"],
+        "playback_key": run["playback_key"],
+        "playback_status": run["playback_status"],
+        "playback_error": run["playback_error"],
+    }
 
 
 def _post_interaction_live_start(

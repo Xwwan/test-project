@@ -8,6 +8,7 @@ from .store import (
     get_run,
     get_session,
     init_db,
+    list_runs_for_session,
     update_run,
     update_session,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "get_run",
     "get_session",
     "init_db",
+    "list_runs_for_session",
     "update_run",
     "update_session",
 ]

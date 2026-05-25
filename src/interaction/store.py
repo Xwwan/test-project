@@ -23,6 +23,11 @@ RUN_COMPLETED = "completed"
 RUN_FAILED = "failed"
 VALID_RUN_STATUSES = {RUN_RUNNING, RUN_COMPLETED, RUN_FAILED}
 
+PLAYBACK_IDLE = "idle"
+PLAYBACK_DONE = "done"
+PLAYBACK_ERROR = "error"
+VALID_PLAYBACK_STATUSES = {PLAYBACK_IDLE, PLAYBACK_DONE, PLAYBACK_ERROR}
+
 INTERACTION_SESSIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS interaction_sessions (
     interaction_session_id TEXT PRIMARY KEY,
@@ -49,6 +54,9 @@ CREATE TABLE IF NOT EXISTS interaction_runs (
     request_id TEXT,
     onboarding_session_id TEXT,
     stage INTEGER,
+    playback_key TEXT,
+    playback_status TEXT DEFAULT 'idle',
+    playback_error TEXT,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL,
     completed_at DATETIME
@@ -87,6 +95,9 @@ def run_migrations(connection: Any) -> None:
         "request_id": "TEXT",
         "onboarding_session_id": "TEXT",
         "stage": "INTEGER",
+        "playback_key": "TEXT",
+        "playback_status": "TEXT DEFAULT 'idle'",
+        "playback_error": "TEXT",
     }.items():
         _ensure_column(
             connection,
@@ -266,11 +277,14 @@ def create_run(
                 request_id,
                 onboarding_session_id,
                 stage,
+                playback_key,
+                playback_status,
+                playback_error,
                 created_at,
                 updated_at,
                 completed_at
             )
-            VALUES (?, ?, ?, ?, ?, '', ?, '', ?, ?, ?, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, '', ?, '', ?, ?, ?, '', ?, '', ?, ?, NULL)
             """,
             (
                 normalized_run_id,
@@ -282,6 +296,7 @@ def create_run(
                 normalized_request_id,
                 normalized_onboarding_session_id,
                 stage,
+                PLAYBACK_IDLE,
                 now,
                 now,
             ),
@@ -310,6 +325,9 @@ def get_run(run_id: str) -> dict:
                 request_id,
                 onboarding_session_id,
                 stage,
+                playback_key,
+                playback_status,
+                playback_error,
                 created_at,
                 updated_at,
                 completed_at
@@ -334,6 +352,9 @@ def update_run(
     request_id: str | None = None,
     onboarding_session_id: str | None = None,
     stage: int | None = None,
+    playback_key: str | None = None,
+    playback_status: str | None = None,
+    playback_error: str | None = None,
     completed_at: str | None = None,
 ) -> dict:
     """Update mutable interaction run fields and return the saved row."""
@@ -360,6 +381,15 @@ def update_run(
     if stage is not None:
         _validate_stage(stage)
         updates["stage"] = stage
+    if playback_key is not None:
+        updates["playback_key"] = _optional_string(playback_key, "playback_key")
+    if playback_status is not None:
+        updates["playback_status"] = _validate_playback_status(playback_status)
+    if playback_error is not None:
+        updates["playback_error"] = _optional_string(
+            playback_error,
+            "playback_error",
+        )
     if completed_at is not None:
         updates["completed_at"] = completed_at
 
@@ -375,6 +405,49 @@ def update_run(
         if cursor.rowcount == 0:
             raise InteractionRunNotFoundError(f"unknown interaction run: {run_id}")
     return get_run(run_id)
+
+
+def list_runs_for_session(
+    interaction_session_id: str,
+    *,
+    limit: int = 50,
+) -> list[dict]:
+    """Return recent runs for one interaction session, oldest first."""
+
+    _validate_id(interaction_session_id, "interaction_session_id")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("limit must be a positive integer")
+    get_session(interaction_session_id)
+    with db.transaction() as connection:
+        run_migrations(connection)
+        rows = connection.execute(
+            """
+            SELECT
+                run_id,
+                interaction_session_id,
+                workflow,
+                input_mode,
+                transcript,
+                reply,
+                status,
+                error,
+                request_id,
+                onboarding_session_id,
+                stage,
+                playback_key,
+                playback_status,
+                playback_error,
+                created_at,
+                updated_at,
+                completed_at
+            FROM interaction_runs
+            WHERE interaction_session_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            LIMIT ?
+            """,
+            (interaction_session_id, limit),
+        ).fetchall()
+    return [_run_row_to_dict(row) for row in rows]
 
 
 def _ensure_column(
@@ -420,6 +493,9 @@ def _run_row_to_dict(row: Any) -> dict:
         "request_id": row["request_id"] or "",
         "onboarding_session_id": row["onboarding_session_id"] or "",
         "stage": row["stage"],
+        "playback_key": row["playback_key"] or "",
+        "playback_status": row["playback_status"] or PLAYBACK_IDLE,
+        "playback_error": row["playback_error"] or "",
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "completed_at": row["completed_at"],
@@ -446,6 +522,12 @@ def _validate_run_status(value: str) -> str:
         raise ValueError(
             "interaction run status must be one of {'running', 'completed', 'failed'}"
         )
+    return value
+
+
+def _validate_playback_status(value: str) -> str:
+    if not isinstance(value, str) or value not in VALID_PLAYBACK_STATUSES:
+        raise ValueError("playback status must be one of {'idle', 'done', 'error'}")
     return value
 
 

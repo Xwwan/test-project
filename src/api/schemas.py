@@ -241,6 +241,23 @@ class InteractionLiveFinishStreamRequest:
 
 
 @dataclass
+class InteractionPlaybackRequest:
+    run_id: str
+    playback_key: str = ""
+    error: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "InteractionPlaybackRequest":
+        if not isinstance(data, dict):
+            raise SchemaError("interaction playback request body must be a JSON object")
+        return cls(
+            run_id=_require_str(data.get("run_id"), "run_id"),
+            playback_key=_optional_str(data.get("playback_key"), "playback_key"),
+            error=_optional_str(data.get("error"), "error"),
+        )
+
+
+@dataclass
 class FollowupDecisionResponse:
     request_id: str
     conversation_id: str

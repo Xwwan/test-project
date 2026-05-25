@@ -237,6 +237,88 @@ class ApiRoutesTest(unittest.TestCase):
         assert body["workflow"] == "chat"
         assert body["conversation_id"] == "conv-1"
 
+    def test_get_interaction_run_and_session_runs(self) -> None:
+        created = interaction_store.create_session(
+            workflow="chat",
+            conversation_id="conv-1",
+            input_mode="text",
+        )
+        run = interaction_store.create_run(
+            interaction_session_id=created["interaction_session_id"],
+            workflow="chat",
+            input_mode="text",
+            transcript="你好",
+            run_id="irun-test",
+        )
+        interaction_store.update_run(
+            run["run_id"],
+            status="completed",
+            reply="你好呀",
+            playback_key="chat-tts-irun-test",
+        )
+
+        status, body = dispatch("GET", "/interaction/runs/irun-test")
+
+        assert status == 200
+        assert body["run_id"] == "irun-test"
+        assert body["reply"] == "你好呀"
+        assert body["playback_key"] == "chat-tts-irun-test"
+
+        status, body = dispatch(
+            "GET",
+            f"/interaction/sessions/{created['interaction_session_id']}/runs",
+        )
+
+        assert status == 200
+        assert body["interaction_session_id"] == created["interaction_session_id"]
+        assert [item["run_id"] for item in body["runs"]] == ["irun-test"]
+
+    def test_interaction_playback_done_and_error_update_run(self) -> None:
+        created = interaction_store.create_session(
+            workflow="chat",
+            conversation_id="conv-1",
+            input_mode="text",
+        )
+        run = interaction_store.create_run(
+            interaction_session_id=created["interaction_session_id"],
+            workflow="chat",
+            run_id="irun-playback",
+        )
+
+        status, body = dispatch(
+            "POST",
+            "/interaction/playback/done",
+            {
+                "run_id": run["run_id"],
+                "playback_key": "chat-tts-irun-playback",
+            },
+        )
+
+        assert status == 200
+        assert body == {
+            "ok": True,
+            "run_id": "irun-playback",
+            "playback_key": "chat-tts-irun-playback",
+            "playback_status": "done",
+        }
+
+        status, body = dispatch(
+            "POST",
+            "/interaction/playback/error",
+            {
+                "run_id": run["run_id"],
+                "playback_key": "chat-tts-irun-playback",
+                "error": "speaker unavailable",
+            },
+        )
+
+        assert status == 200
+        assert body["playback_status"] == "error"
+        assert body["playback_error"] == "speaker unavailable"
+        updated = interaction_store.get_run(run["run_id"])
+        assert updated["playback_status"] == "error"
+        assert updated["playback_error"] == "speaker unavailable"
+
     def test_interaction_text_stream_wraps_chat_workflow(self) -> None:
         deps, _, _ = _build_dependencies(initial_reply="统一入口")
         created = interaction_store.create_session(
