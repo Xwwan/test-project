@@ -158,6 +158,8 @@ def dispatch(
             return _post_interaction_live_chunk(body, live_asr_manager)
         if method == "GET" and pure_path == "/interaction/live/transcript":
             return _get_interaction_live_transcript(query, live_asr_manager)
+        if method == "POST" and pure_path == "/interaction/live/finish-transcript":
+            return _post_interaction_live_finish_transcript(body, live_asr_manager)
         if method == "POST" and pure_path == "/interaction/live/abort":
             return _post_interaction_live_abort(body, live_asr_manager)
         if method == "POST" and pure_path == "/voice/chat":
@@ -381,6 +383,30 @@ def _get_interaction_live_transcript(
         "workflow": workflow,
         "live_session_id": live_session_id,
         "session_id": live_session_id,
+        "transcript": state.transcript,
+        "is_final": state.is_final,
+        "error": state.error,
+    }
+
+
+def _post_interaction_live_finish_transcript(
+    body: Any,
+    live_asr_manager: LiveAsrSessionManager | None,
+) -> JSONResponse:
+    request = InteractionLiveSessionRequest.from_dict(body or {})
+    _require_interaction_session_workflow(
+        request.interaction_session_id,
+        request.workflow,
+    )
+    manager = live_asr_manager or get_default_live_asr_manager()
+    state = manager.finish_session(request.live_session_id)
+    if state.error:
+        raise ValueError(state.error)
+    return 200, {
+        "interaction_session_id": request.interaction_session_id,
+        "workflow": request.workflow,
+        "live_session_id": request.live_session_id,
+        "session_id": request.live_session_id,
         "transcript": state.transcript,
         "is_final": state.is_final,
         "error": state.error,

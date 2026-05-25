@@ -19,6 +19,7 @@
 | `POST` | `/interaction/live/start` | 在 interaction session 下开始实时语音识别 |
 | `POST` | `/interaction/live/chunk` | 向 interaction live ASR 会话提交音频分块 |
 | `GET` | `/interaction/live/transcript` | 查询 interaction live ASR 最新字幕 |
+| `POST` | `/interaction/live/finish-transcript` | 结束 interaction live ASR，只返回最终字幕 |
 | `POST` | `/interaction/live/finish-stream` | 结束 live ASR，并按 `workflow` 分流为 interaction SSE |
 | `POST` | `/interaction/live/abort` | 中止 interaction live ASR 会话 |
 | `POST` | `/interaction/playback/done` | 标记某个 run 的播放任务完成 |
@@ -264,7 +265,39 @@ interaction_session_id=isess_xxx&workflow=chat&live_session_id=live_xxx
 }
 ```
 
-### 2.9 `POST /interaction/live/finish-stream`
+### 2.9 `POST /interaction/live/finish-transcript`
+
+请求：
+
+```json
+{
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "chat | onboarding",
+  "live_session_id": "live_<uuid4_hex>"
+}
+```
+
+响应：
+
+```json
+{
+  "interaction_session_id": "isess_<uuid4_hex>",
+  "workflow": "chat",
+  "live_session_id": "live_<uuid4_hex>",
+  "session_id": "live_<uuid4_hex>",
+  "transcript": "最终识别文本",
+  "is_final": true,
+  "error": null
+}
+```
+
+约定：
+
+- 该接口只结束 ASR 并返回最终字幕，不创建 interaction run。
+- 该接口不进入 `chat` 回复、不推进 `onboarding` 阶段、不触发 retrieval/follow-up、不生成 TTS。
+- 前端若要用该字幕继续对话，应把返回的 `transcript` 作为 `message` 调用 `/interaction/runs/text-stream`，由同一套 `workflow` 分流进入 `chat` 或 `onboarding`。
+
+### 2.10 `POST /interaction/live/finish-stream`
 
 请求：
 
@@ -299,7 +332,7 @@ data: {"workflow":"chat","interaction_session_id":"isess_xxx","run_id":"irun_xxx
 - `workflow=onboarding` 进入 onboarding，不创建 `request_id`，不触发 retrieval/follow-up。
 - `tts_enabled=true` 时，`audio` 事件与文本流并发输出。
 
-### 2.10 `POST /interaction/live/abort`
+### 2.11 `POST /interaction/live/abort`
 
 请求：
 
@@ -322,7 +355,7 @@ data: {"workflow":"chat","interaction_session_id":"isess_xxx","run_id":"irun_xxx
 }
 ```
 
-### 2.11 `POST /interaction/playback/done`
+### 2.12 `POST /interaction/playback/done`
 
 请求：
 
@@ -344,7 +377,7 @@ data: {"workflow":"chat","interaction_session_id":"isess_xxx","run_id":"irun_xxx
 }
 ```
 
-### 2.12 `POST /interaction/playback/error`
+### 2.13 `POST /interaction/playback/error`
 
 请求：
 

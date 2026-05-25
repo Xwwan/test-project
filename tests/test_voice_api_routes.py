@@ -837,6 +837,45 @@ class VoiceApiRoutesTest(unittest.TestCase):
         assert body["ok"] is True
         assert manager.aborted == ["live-1"]
 
+    def test_interaction_live_finish_transcript_returns_text_without_run(self) -> None:
+        session = interaction_store.create_session(
+            workflow="onboarding",
+            conversation_id="conv-onb",
+            input_mode="local",
+        )
+        manager = FakeLiveAsrManager()
+        manager.states["live-1"] = LiveTranscriptState(
+            transcript="只要字幕",
+            is_final=True,
+            error=None,
+        )
+
+        status, body = dispatch(
+            "POST",
+            "/interaction/live/finish-transcript",
+            {
+                "interaction_session_id": session["interaction_session_id"],
+                "workflow": "onboarding",
+                "live_session_id": "live-1",
+            },
+            live_asr_manager=manager,
+        )
+
+        assert status == 200
+        assert body == {
+            "interaction_session_id": session["interaction_session_id"],
+            "workflow": "onboarding",
+            "live_session_id": "live-1",
+            "session_id": "live-1",
+            "transcript": "只要字幕",
+            "is_final": True,
+            "error": None,
+        }
+        assert manager.finished == ["live-1"]
+        assert interaction_store.list_runs_for_session(
+            session["interaction_session_id"]
+        ) == []
+
     def test_interaction_live_finish_stream_routes_chat_workflow(self) -> None:
         session = interaction_store.create_session(
             workflow="chat",
