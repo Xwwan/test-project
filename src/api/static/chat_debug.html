@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>对话 Agent 调试</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #667085;
+      --line: #d8dee9;
+      --panel: #ffffff;
+      --page: #f6f8fb;
+      --soft: #edf2f7;
+      --accent: #0f766e;
+      --accent-strong: #115e59;
+      --user: #0f766e;
+      --assistant: #ffffff;
+      --followup: #fff7ed;
+      --danger: #b42318;
+      --code: #111827;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background: var(--page);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
+      gap: 14px;
+      width: min(1280px, calc(100vw - 28px));
+      height: 100vh;
+      margin: 0 auto;
+      padding: 14px 0;
+    }
+
+    .chat,
+    .trace {
+      display: grid;
+      min-height: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .chat {
+      grid-template-rows: auto minmax(0, 1fr) auto;
+    }
+
+    .trace {
+      grid-template-rows: auto auto minmax(0, 1fr);
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1,
+    h2 {
+      margin: 0;
+      font-size: 17px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    .status {
+      min-width: 110px;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: right;
+    }
+
+    .status.error {
+      color: var(--danger);
+    }
+
+    .setup {
+      display: grid;
+      grid-template-columns: minmax(180px, 260px) 1fr auto;
+      gap: 10px;
+      align-items: end;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    input,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--ink);
+      background: #fff;
+      font: inherit;
+    }
+
+    input {
+      height: 38px;
+      padding: 0 10px;
+    }
+
+    textarea {
+      min-height: 48px;
+      max-height: 160px;
+      resize: vertical;
+      padding: 9px 10px;
+      line-height: 1.45;
+    }
+
+    button {
+      height: 38px;
+      border: 0;
+      border-radius: 6px;
+      padding: 0 14px;
+      color: #fff;
+      background: var(--accent);
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: var(--accent-strong);
+    }
+
+    button.secondary {
+      color: var(--ink);
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+
+    button.secondary:hover {
+      background: #eef2f7;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: .55;
+    }
+
+    .messages {
+      display: flex;
+      min-height: 0;
+      flex-direction: column;
+      gap: 10px;
+      overflow: auto;
+      padding: 14px;
+    }
+
+    .message {
+      display: grid;
+      max-width: min(760px, 88%);
+      gap: 5px;
+    }
+
+    .message.user {
+      align-self: end;
+    }
+
+    .message.assistant,
+    .message.followup {
+      align-self: start;
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .bubble {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.55;
+    }
+
+    .user .bubble {
+      color: #fff;
+      border-color: var(--user);
+      background: var(--user);
+    }
+
+    .assistant .bubble {
+      background: var(--assistant);
+    }
+
+    .followup .bubble {
+      border-color: #fed7aa;
+      background: var(--followup);
+    }
+
+    .composer {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      padding: 12px 14px;
+      border-top: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .trace-controls,
+    .facts {
+      display: grid;
+      gap: 8px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .facts {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      background: #fbfcfe;
+    }
+
+    .fact {
+      min-width: 0;
+    }
+
+    .fact span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .fact strong {
+      display: block;
+      overflow: hidden;
+      margin-top: 4px;
+      font-size: 13px;
+      line-height: 1.3;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      letter-spacing: 0;
+    }
+
+    .trace-list {
+      min-height: 0;
+      overflow: auto;
+      padding: 12px 14px;
+    }
+
+    .event {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 10px;
+      background: #fff;
+    }
+
+    .event summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 9px 10px;
+      cursor: pointer;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .event pre {
+      margin: 0;
+      max-height: 220px;
+      overflow: auto;
+      border-top: 1px solid var(--line);
+      padding: 10px;
+      color: var(--code);
+      background: #fbfcfe;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.45;
+      font-size: 12px;
+    }
+
+    .time {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 500;
+    }
+
+    @media (max-width: 920px) {
+      main {
+        grid-template-columns: 1fr;
+        height: auto;
+        min-height: 100vh;
+      }
+
+      .chat {
+        min-height: 70vh;
+      }
+
+      .trace {
+        min-height: 420px;
+      }
+
+      .setup,
+      .composer {
+        grid-template-columns: 1fr;
+      }
+
+      button {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="chat">
+      <header>
+        <h1>对话调试</h1>
+        <div id="status" class="status">就绪</div>
+      </header>
+
+      <div class="setup">
+        <label>
+          conversation_id
+          <input id="conversationId" value="chat-debug-demo">
+        </label>
+        <label>
+          预填输入
+          <input id="preset" value="你还记得我之前提过哪些偏好吗？">
+        </label>
+        <button id="resetButton" class="secondary">重置会话视图</button>
+      </div>
+
+      <div id="messages" class="messages"></div>
+
+      <div class="composer">
+        <textarea id="message" placeholder="输入一句话，Enter 发送，Shift+Enter 换行"></textarea>
+        <button id="sendButton">发送</button>
+      </div>
+    </section>
+
+    <aside class="trace">
+      <header>
+        <h2>Agent Trace</h2>
+        <button id="clearTraceButton" class="secondary">清空 Trace</button>
+      </header>
+
+      <div class="facts">
+        <div class="fact"><span>request_id</span><strong id="requestId">-</strong></div>
+        <div class="fact"><span>turn_id</span><strong id="turnId">-</strong></div>
+        <div class="fact"><span>retrieval</span><strong id="retrieval">-</strong></div>
+        <div class="fact"><span>memory ids</span><strong id="memoryIds">-</strong></div>
+      </div>
+
+      <div class="trace-controls">
+        <button id="refreshPendingButton" class="secondary">刷新 followup pending</button>
+      </div>
+
+      <div id="traceList" class="trace-list"></div>
+    </aside>
+  </main>
+
+  <script>
+    const statusEl = document.querySelector("#status");
+    const conversationEl = document.querySelector("#conversationId");
+    const presetEl = document.querySelector("#preset");
+    const messageEl = document.querySelector("#message");
+    const messagesEl = document.querySelector("#messages");
+    const sendButton = document.querySelector("#sendButton");
+    const resetButton = document.querySelector("#resetButton");
+    const clearTraceButton = document.querySelector("#clearTraceButton");
+    const refreshPendingButton = document.querySelector("#refreshPendingButton");
+    const traceListEl = document.querySelector("#traceList");
+    const requestIdEl = document.querySelector("#requestId");
+    const turnIdEl = document.querySelector("#turnId");
+    const retrievalEl = document.querySelector("#retrieval");
+    const memoryIdsEl = document.querySelector("#memoryIds");
+
+    let followupSource = null;
+    let activeAssistantBubble = null;
+    let activeRequestId = "";
+    let traceItems = [];
+
+    messageEl.value = presetEl.value;
+
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.classList.toggle("error", isError);
+    }
+
+    function setBusy(isBusy) {
+      sendButton.disabled = isBusy;
+    }
+
+    function conversationId() {
+      return conversationEl.value.trim();
+    }
+
+    function ensureFollowupStream() {
+      const id = conversationId();
+      if (!id) throw new Error("conversation_id 为空");
+      if (followupSource) followupSource.close();
+      followupSource = new EventSource(`/followups/stream?conversation_id=${encodeURIComponent(id)}`);
+      followupSource.addEventListener("open", () => addTrace("followup.stream.open", {conversation_id: id}));
+      followupSource.addEventListener("followup", (event) => {
+        const data = JSON.parse(event.data);
+        addTrace("followup", data, true);
+        addMessage("followup", data.reply || "", {
+          label: `followup · ${data.followup_type || "supplement"}`,
+          requestId: data.request_id,
+        });
+        if (data.request_id === activeRequestId) {
+          retrievalEl.textContent = "completed + followup";
+        }
+      });
+      followupSource.addEventListener("ping", (event) => {
+        addTrace("followup.ping", JSON.parse(event.data));
+      });
+      followupSource.addEventListener("error", () => {
+        addTrace("followup.stream.error", {message: "disconnected"});
+      });
+    }
+
+    function addMessage(role, content, options = {}) {
+      const wrapper = document.createElement("article");
+      wrapper.className = `message ${role}`;
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = options.label || role;
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.textContent = content;
+      wrapper.append(meta, bubble);
+      messagesEl.append(wrapper);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return bubble;
+    }
+
+    function updateFacts(data) {
+      if (data.request_id) {
+        activeRequestId = data.request_id;
+        requestIdEl.textContent = data.request_id;
+      }
+      if (data.turn_id) turnIdEl.textContent = data.turn_id;
+      if (data.retrieval_status) retrievalEl.textContent = data.retrieval_status;
+      if (Array.isArray(data.retrieved_memory_ids)) {
+        memoryIdsEl.textContent = data.retrieved_memory_ids.length
+          ? data.retrieved_memory_ids.join(", ")
+          : "-";
+      }
+    }
+
+    function addTrace(event, data, open = false) {
+      traceItems.push({event, data, at: new Date().toLocaleTimeString()});
+      if (traceItems.length > 80) traceItems = traceItems.slice(-80);
+      renderTrace(open ? traceItems.length - 1 : -1);
+    }
+
+    function renderTrace(openIndex = -1) {
+      traceListEl.innerHTML = "";
+      traceItems.forEach((item, index) => {
+        const detail = document.createElement("details");
+        detail.className = "event";
+        if (index === openIndex || index === traceItems.length - 1) detail.open = true;
+        const summary = document.createElement("summary");
+        const label = document.createElement("span");
+        label.textContent = item.event;
+        const time = document.createElement("span");
+        time.className = "time";
+        time.textContent = item.at;
+        const pre = document.createElement("pre");
+        pre.textContent = JSON.stringify(item.data, null, 2);
+        summary.append(label, time);
+        detail.append(summary, pre);
+        traceListEl.append(detail);
+      });
+      traceListEl.scrollTop = traceListEl.scrollHeight;
+    }
+
+    async function sendMessage() {
+      const id = conversationId();
+      const text = messageEl.value.trim();
+      if (!id) {
+        setStatus("conversation_id 为空", true);
+        return;
+      }
+      if (!text) {
+        setStatus("消息为空", true);
+        return;
+      }
+
+      ensureFollowupStream();
+      addMessage("user", text, {label: "user"});
+      activeAssistantBubble = addMessage("assistant", "", {label: "assistant · initial"});
+      messageEl.value = "";
+      requestIdEl.textContent = "-";
+      turnIdEl.textContent = "-";
+      retrievalEl.textContent = "initial";
+      memoryIdsEl.textContent = "-";
+      setBusy(true);
+      setStatus("首轮回复中");
+
+      try {
+        const response = await fetch("/chat/stream", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            conversation_id: id,
+            message: text,
+          }),
+        });
+        if (!response.ok || !response.body) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(data.error?.message || `HTTP ${response.status}`);
+        }
+        await readSse(response.body, (event, data) => {
+          addTrace(`chat.${event}`, data);
+          if (event === "meta") {
+            updateFacts(data);
+            setStatus("流式输出中");
+          }
+          if (event === "delta") {
+            activeAssistantBubble.textContent += data.delta || "";
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+          }
+          if (event === "audio") {
+            addTrace("chat.audio", {bytes_base64: (data.audio_base64 || "").length});
+          }
+          if (event === "done") {
+            updateFacts(data);
+            if (data.reply) activeAssistantBubble.textContent = data.reply;
+            setStatus("首轮完成，后台检索中");
+          }
+          if (event === "error") {
+            throw new Error(data.message || "stream error");
+          }
+        });
+        await refreshPending();
+        setStatus("等待 followup 或下一轮输入");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+        addTrace("error", {message: error.message || String(error)}, true);
+      } finally {
+        setBusy(false);
+        messageEl.focus();
+      }
+    }
+
+    async function refreshPending() {
+      const response = await fetch("/followups/pending");
+      const data = await response.json();
+      addTrace("followups.pending", data);
+      if (!response.ok) {
+        throw new Error(data.error?.message || `HTTP ${response.status}`);
+      }
+      const pending = data.pending || [];
+      if (!pending.length) return;
+      for (const item of pending) {
+        if (item.conversation_id !== conversationId()) continue;
+        await runFollowup(item.request_id);
+      }
+    }
+
+    async function runFollowup(requestId) {
+      if (!requestId) return;
+      const response = await fetch(`/followups/${encodeURIComponent(requestId)}/run`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: "{}",
+      });
+      const data = await response.json();
+      addTrace("followups.run", data, true);
+      if (!response.ok) {
+        throw new Error(data.error?.message || `HTTP ${response.status}`);
+      }
+      if (data.decision === "followup" && data.reply) {
+        addMessage("followup", data.reply, {
+          label: `followup · ${data.followup_type || "supplement"}`,
+          requestId: data.request_id,
+        });
+      }
+    }
+
+    async function readSse(body, onEvent) {
+      const reader = body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, {stream: true});
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() || "";
+        for (const frame of frames) {
+          const parsed = parseSseFrame(frame);
+          if (parsed) onEvent(parsed.event, parsed.data);
+        }
+      }
+      if (buffer.trim()) {
+        const parsed = parseSseFrame(buffer);
+        if (parsed) onEvent(parsed.event, parsed.data);
+      }
+    }
+
+    function parseSseFrame(frame) {
+      let event = "message";
+      const dataLines = [];
+      for (const line of frame.split(/\r?\n/)) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      }
+      if (!dataLines.length) return null;
+      return {event, data: JSON.parse(dataLines.join("\n"))};
+    }
+
+    sendButton.addEventListener("click", sendMessage);
+    refreshPendingButton.addEventListener("click", () => {
+      refreshPending().catch((error) => setStatus(error.message || String(error), true));
+    });
+    clearTraceButton.addEventListener("click", () => {
+      traceItems = [];
+      renderTrace();
+      setStatus("Trace 已清空");
+    });
+    resetButton.addEventListener("click", () => {
+      messagesEl.innerHTML = "";
+      requestIdEl.textContent = "-";
+      turnIdEl.textContent = "-";
+      retrievalEl.textContent = "-";
+      memoryIdsEl.textContent = "-";
+      setStatus("视图已重置");
+    });
+    presetEl.addEventListener("change", () => {
+      if (!messageEl.value.trim()) messageEl.value = presetEl.value;
+    });
+    messageEl.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        sendMessage();
+      }
+    });
+
+    ensureFollowupStream();
+    messageEl.focus();
+  </script>
+</body>
+</html>

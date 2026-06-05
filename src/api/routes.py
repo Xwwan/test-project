@@ -77,6 +77,7 @@ logger = logging.getLogger("chat-service.api")
 _FOLLOWUP_RUN_PATTERN = re.compile(r"^/followups/(?P<request_id>[^/]+)/run$")
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _VOICE_LATENCY_PAGE = _STATIC_DIR / "voice_latency.html"
+_CHAT_DEBUG_PAGE = _STATIC_DIR / "chat_debug.html"
 _TTS_SENTINEL = object()
 _STREAM_SENTINEL = object()
 _TTS_SEGMENT_PUNCTUATION = "。！？!?；;\n"
@@ -828,6 +829,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         return None
 
     def _handle(self, method: str) -> None:
+        if method == "GET" and urlsplit(self.path).path in {"/", "/chat"}:
+            self._write_html_file(_CHAT_DEBUG_PAGE)
+            return
         if method == "GET" and urlsplit(self.path).path == "/tools/voice-latency":
             self._write_html_file(_VOICE_LATENCY_PAGE)
             return

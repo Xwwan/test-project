@@ -98,6 +98,35 @@ class RequestCoordinatorTest(unittest.TestCase):
         assert get_request(request_id)["status"] == "retrieval_completed"
 
 
+    def test_retrieval_pending_can_start_before_initial_reply(self) -> None:
+        record = create_request("conv-1", "hello")
+        request_id = record["request_id"]
+
+        mark_retrieval_pending(request_id)
+        after_pending = get_request(request_id)
+        assert after_pending["status"] == "retrieval_pending"
+        assert after_pending["retrieval_status"] == "pending"
+
+        mark_initial_reply(request_id, "hi", assistant_turn_id="turn_assistant")
+        after_reply = get_request(request_id)
+        assert after_reply["status"] == "retrieval_pending"
+        assert after_reply["initial_reply"] == "hi"
+        assert after_reply["initial_reply_turn_id"] == "turn_assistant"
+
+
+    def test_initial_reply_can_be_recorded_after_fast_retrieval_completion(self) -> None:
+        record = create_request("conv-1", "hello")
+        request_id = record["request_id"]
+
+        mark_retrieval_pending(request_id)
+        mark_retrieval_completed(request_id, [{"id": 1, "summary": "x"}])
+        mark_initial_reply(request_id, "hi")
+
+        after_reply = get_request(request_id)
+        assert after_reply["status"] == "retrieval_completed"
+        assert after_reply["initial_reply"] == "hi"
+
+
     def test_pending_followup_queue_lists_only_retrieval_completed_requests(self) -> None:
         record_a = create_request("conv-1", "msg-a")
         record_b = create_request("conv-2", "msg-b")
@@ -182,9 +211,6 @@ class RequestCoordinatorTest(unittest.TestCase):
     def test_invalid_transitions_raise_request_state_error(self) -> None:
         record = create_request("conv-1", "hello")
         request_id = record["request_id"]
-
-        with self.assertRaises(RequestStateError):
-            mark_retrieval_pending(request_id)
 
         mark_initial_reply(request_id, "hi")
         with self.assertRaises(RequestStateError):

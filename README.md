@@ -125,6 +125,40 @@ conda run -n toy python scripts/latency_benchmark.py --prompts data/latency-prom
 conda run -n toy python scripts/latency_benchmark.py --repeat 3 --output-dir data/my-latency-results
 ```
 
+## 老年多轮闲聊 benchmark / LLM judge
+
+真实模型评测不会进入默认单元测试。运行前在 `.env` 或 shell 环境里配置：
+
+```env
+APP_DB_PATH=data/app.db
+APP_DATA_DIR=data
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_API_KEY=<set-locally>
+AGENT_MODEL=deepseek-v4-flash
+JUDGE_MODEL=deepseek-v4-pro
+```
+
+手动运行：
+
+```bash
+conda run -n memorae bash -ilc 'CHAT_DEBUG_PROMPTS=0 python scripts/elder_chat_benchmark.py'
+```
+
+脚本默认围绕 `data/app.db` 中的季羡林相关记忆运行多类开放闲聊案例，Agent A/B 使用
+`deepseek-v4-flash`，judge 使用 `deepseek-v4-pro`。报告保存到
+`data/benchmark-results/`，包含案例输入、Agent A 输出、Agent B 检索/决策/第二段、
+延迟指标、judge 多维分数、通过率和失败原因。可用 `--limit N` 跑前 N 个案例，或
+`--skip-judge` 只检查真实 Agent 与延迟报告结构。
+
+退出码：`0` 表示真实 judge 通过率达到 90%、judge 1-10 均分达到 8.5、
+首尾衔接均分严格超过 8.8、延迟通过率达到 80%，且 Agent B follow-up 开头
+最高重复占比不超过 25%；`1` 表示真实 benchmark 已运行但未达标；`2` 表示缺少
+`DEEPSEEK_API_KEY`，脚本会保存 `run_status=not_run` 报告，不能作为验收通过结果。
+
+本轮老年多轮闲聊双 Agent 优化的修改清单、测试说明和当前 benchmark 状态见
+`docs/elder-chat-optimization-delivery.md`；本次更新索引和数据位置见
+`docs/elder-chat-tail-head-update-20260605.md`。
+
 语音延迟测试复用服务端已有实时 ASR 流程。先启动服务：
 
 ```bash

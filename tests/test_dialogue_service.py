@@ -7,8 +7,10 @@ import time
 from typing import Any
 
 import unittest
+from unittest.mock import patch
 
 from src.coordinator import request_coordinator
+from src.services import dialogue_service
 from src.services import (
     DialogueDependencies,
     apply_operations,
@@ -108,6 +110,32 @@ class RecordingInitialReplyStreamFn:
         yield from self.chunks
 
 
+class BlockingInitialReplyStreamFn:
+    def __init__(
+        self,
+        *,
+        retrieval_started: threading.Event,
+        allow_delta: threading.Event,
+        chunks: list[str] | None = None,
+    ) -> None:
+        self.retrieval_started = retrieval_started
+        self.allow_delta = allow_delta
+        self.chunks = chunks or ["首", "答"]
+        self.last_input: dict | None = None
+        self.retrieval_started_before_first_delta = False
+        self.entered = threading.Event()
+
+    def __call__(self, input_data: dict, *, model_client: Any = None, **kwargs: Any):
+        self.last_input = input_data
+        self.entered.set()
+        self.retrieval_started_before_first_delta = self.retrieval_started.wait(
+            timeout=5,
+        )
+        if not self.allow_delta.wait(timeout=2):
+            raise AssertionError("initial stream was not released")
+        yield from self.chunks
+
+
 class RecordingRetrievalFn:
     def __init__(self, selected_ids: list[int]) -> None:
         self.selected_ids = list(selected_ids)
@@ -122,6 +150,20 @@ class RecordingRetrievalFn:
             "needs_full_load": bool(self.selected_ids),
             "strategy": "fake",
         }
+
+
+class WaitingSubmitExecutor:
+    def __init__(self, wait_for: threading.Event) -> None:
+        self.wait_for = wait_for
+        self.threads: list[threading.Thread] = []
+
+    def submit(self, fn, *args, **kwargs):
+        thread = threading.Thread(target=fn, args=args, kwargs=kwargs)
+        self.threads.append(thread)
+        thread.start()
+        if not self.wait_for.wait(timeout=5):
+            raise AssertionError("background retrieval did not start")
+        return thread
 
 
 class RecordingFollowupFn:
@@ -326,6 +368,158 @@ class DialogueServiceTest(unittest.TestCase):
         ]
         assert request_id not in pending_ids
         assert request_coordinator.get_request(request_id)["status"] == "no_followup_needed"
+
+    def test_stream_retrieval_starts_before_first_delta(self) -> None:
+        retrieval_started = threading.Event()
+        allow_delta = threading.Event()
+        allow_retrieval_finish = threading.Event()
+        followup_inputs: list[dict] = []
+        memory = FakeMemoryStore(lightweight=[{"id": 7, "summary": "童年贪玩"}])
+
+        def slow_retrieval(**kwargs: Any) -> dict:
+            retrieval_started.set()
+            if not allow_retrieval_finish.wait(timeout=2):
+                raise AssertionError("retrieval was not released")
+            return {
+                "request_id": kwargs["request_id"],
+                "selected_memory_ids": [7],
+            }
+
+        def followup(input_data: dict, **kwargs: Any) -> dict:
+            followup_inputs.append(input_data)
+            return {
+                "request_id": input_data["request_id"],
+                "decision": "followup",
+                "followup_type": "supplement",
+                "reply": "我记得你以前也提过小时候爱在外头玩。",
+            }
+
+        initial_stream = BlockingInitialReplyStreamFn(
+            retrieval_started=retrieval_started,
+            allow_delta=allow_delta,
+            chunks=["[emo:idle][act:😁]听起来那时候很热闹呀。"],
+        )
+        deps = _build_deps(
+            memory_store=memory,
+            initial_reply_stream_fn=initial_stream,
+            retrieval_fn=slow_retrieval,
+            followup_fn=followup,
+        )
+
+        events: list[dict] = []
+
+        def consume_stream() -> None:
+            for event in handle_chat_message_stream(
+                "conv-1",
+                "我小时候可贪玩了",
+                dependencies=deps,
+            ):
+                events.append(event)
+
+        executor = WaitingSubmitExecutor(retrieval_started)
+        thread = threading.Thread(target=consume_stream)
+        with patch.object(dialogue_service, "_get_retrieval_executor", return_value=executor):
+            thread.start()
+            try:
+                _wait_until(
+                    lambda: bool(events)
+                    and events[0]["event"] == "meta"
+                    and initial_stream.entered.is_set(),
+                    timeout=5,
+                )
+                assert initial_stream.retrieval_started_before_first_delta
+                assert [event["event"] for event in events] == ["meta"]
+                allow_delta.set()
+                thread.join(timeout=2)
+                assert not thread.is_alive()
+            finally:
+                allow_delta.set()
+                allow_retrieval_finish.set()
+                thread.join(timeout=2)
+
+        assert [event["event"] for event in events] == ["meta", "delta", "done"]
+        request_id = events[-1]["data"]["request_id"]
+        record_before_release = request_coordinator.get_request(request_id)
+        assert record_before_release["status"] == "retrieval_pending"
+        assert record_before_release["initial_reply"].startswith("[emo:idle][act:😁]")
+
+        allow_retrieval_finish.set()
+        _wait_until(
+            lambda: request_coordinator.get_request(request_id)["status"]
+            == "followup_generated"
+        )
+        assert followup_inputs
+        assert followup_inputs[0]["initial_reply"].startswith("[emo:idle][act:😁]")
+
+    def test_followup_waits_for_full_initial_reply_when_retrieval_finishes_first(self) -> None:
+        allow_delta = threading.Event()
+        followup_started = threading.Event()
+        followup_inputs: list[dict] = []
+        memory = FakeMemoryStore(lightweight=[{"id": 7, "summary": "喜欢读书"}])
+
+        def immediate_retrieval(**kwargs: Any) -> dict:
+            return {
+                "request_id": kwargs["request_id"],
+                "selected_memory_ids": [7],
+            }
+
+        def followup(input_data: dict, **kwargs: Any) -> dict:
+            followup_inputs.append(input_data)
+            followup_started.set()
+            return {
+                "request_id": input_data["request_id"],
+                "decision": "followup",
+                "followup_type": "supplement",
+                "reply": "我记得你以前提过读书这件事。",
+            }
+
+        def blocked_initial_stream(input_data: dict, **kwargs: Any):
+            if not allow_delta.wait(timeout=2):
+                raise AssertionError("initial stream was not released")
+            yield "[emo:idle][act:😁]你提到读书，我听着挺亲切。"
+
+        deps = _build_deps(
+            memory_store=memory,
+            initial_reply_stream_fn=blocked_initial_stream,
+            retrieval_fn=immediate_retrieval,
+            followup_fn=followup,
+        )
+
+        events: list[dict] = []
+
+        def consume_stream() -> None:
+            for event in handle_chat_message_stream(
+                "conv-1",
+                "我这两天又翻书看了",
+                dependencies=deps,
+            ):
+                events.append(event)
+
+        thread = threading.Thread(target=consume_stream)
+        thread.start()
+        _wait_until(
+            lambda: bool(events)
+            and events[0]["event"] == "meta"
+            and any(
+                event["status"] == "retrieval_completed"
+                for event in request_coordinator.get_request(
+                    events[0]["data"]["request_id"]
+                )["status_history"]
+            )
+        )
+        assert not followup_started.is_set()
+
+        allow_delta.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        request_id = events[-1]["data"]["request_id"]
+        _wait_until(
+            lambda: request_coordinator.get_request(request_id)["status"]
+            == "followup_generated"
+        )
+        assert followup_inputs[0]["initial_reply"] == (
+            "[emo:idle][act:😁]你提到读书，我听着挺亲切。"
+        )
 
     def test_each_stream_request_uses_its_own_retrieval_snapshot(self) -> None:
         allow_a_retrieval_finish = threading.Event()

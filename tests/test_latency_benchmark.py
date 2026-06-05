@@ -56,11 +56,11 @@ class LatencyBenchmarkTest(unittest.TestCase):
                 run_text_latency_benchmark(["第一段"], chat_call=empty_stream)
 
     def test_load_prompts_reads_one_prompt_per_line(self) -> None:
-        path = "/private/tmp/latency-prompts.txt"
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("一\n\n二\n")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "latency-prompts.txt"
+            path.write_text("一\n\n二\n", encoding="utf-8")
 
-        self.assertEqual(load_prompts(path), ["一", "二"])
+            self.assertEqual(load_prompts(path), ["一", "二"])
 
     def test_save_benchmark_result_writes_timestamped_json_with_full_reply(self) -> None:
         with patch(

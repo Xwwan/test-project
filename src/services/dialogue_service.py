@@ -40,6 +40,8 @@ RETRIEVAL_STATUS_FAILED = "failed"
 
 DEFAULT_RETRIEVAL_MAX_WORKERS = 4
 DEFAULT_FOLLOWUP_CONTEXT_WINDOW_TURNS = 50
+FOLLOWUP_INITIAL_REPLY_WAIT_SECONDS = 30.0
+FOLLOWUP_READY_DRAIN_SECONDS = 0.05
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,45 @@ class DialogueTurnSnapshot:
             "initial_reply": self.initial_reply,
             "initial_reply_turn_id": self.initial_reply_turn_id,
         }
+
+
+class PendingInitialReply:
+    """Thread-safe handoff from Agent A streaming to background follow-up."""
+
+    def __init__(self, snapshot: DialogueTurnSnapshot) -> None:
+        self._snapshot = snapshot
+        self._event = threading.Event()
+        self._retrieval_completed = threading.Event()
+        self._followup_completed = threading.Event()
+        self._lock = threading.Lock()
+
+    def set_initial_reply(self, reply: str, assistant_turn_id: str) -> DialogueTurnSnapshot:
+        with self._lock:
+            self._snapshot = replace(
+                self._snapshot,
+                initial_reply=reply,
+                initial_reply_turn_id=assistant_turn_id,
+            )
+            self._event.set()
+            return self._snapshot
+
+    def wait(self, timeout: float | None = None) -> DialogueTurnSnapshot | None:
+        if not self._event.wait(timeout=timeout):
+            return None
+        with self._lock:
+            return self._snapshot
+
+    def mark_retrieval_completed(self) -> None:
+        self._retrieval_completed.set()
+
+    def mark_followup_completed(self) -> None:
+        self._followup_completed.set()
+
+    def retrieval_completed(self) -> bool:
+        return self._retrieval_completed.is_set()
+
+    def wait_followup_completed(self, timeout: float) -> bool:
+        return self._followup_completed.wait(timeout=timeout)
 
 
 class FollowupDeliveryBus:
@@ -402,6 +443,20 @@ def handle_chat_message_stream(
             },
         }
 
+        request_coordinator.mark_retrieval_pending(request_id)
+        logger.info(
+            "memory retrieval marked pending request_id=%s conversation_id=%s "
+            "mode=background parallel_with_initial=true",
+            request_id,
+            conversation_id,
+        )
+        pending_initial_reply = PendingInitialReply(snapshot)
+        _run_retrieval_in_background(
+            deps=deps,
+            snapshot=snapshot,
+            pending_initial_reply=pending_initial_reply,
+        )
+
         stream = deps.generate_initial_reply_stream(
             {
                 "request_id": request_id,
@@ -435,6 +490,7 @@ def handle_chat_message_stream(
             initial_reply=reply_text,
             initial_reply_turn_id=initial_reply_turn_id,
         )
+        pending_initial_reply.set_initial_reply(reply_text, initial_reply_turn_id)
         request_coordinator.attach_context_snapshot(request_id, snapshot.to_dict())
         request_coordinator.mark_initial_reply(
             request_id,
@@ -447,16 +503,8 @@ def handle_chat_message_stream(
             conversation_id,
             len(reply_text),
         )
-
-        request_coordinator.mark_retrieval_pending(request_id)
-        logger.info(
-            "memory retrieval marked pending request_id=%s conversation_id=%s mode=background",
-            request_id,
-            conversation_id,
-        )
-        _run_retrieval_in_background(
-            deps=deps,
-            snapshot=snapshot,
+        pending_initial_reply.wait_followup_completed(
+            timeout=FOLLOWUP_READY_DRAIN_SECONDS,
         )
     except Exception as exc:
         request_coordinator.mark_failed(request_id, str(exc) or exc.__class__.__name__)
@@ -786,13 +834,17 @@ def _run_retrieval_in_background(
     *,
     deps: DialogueDependencies,
     snapshot: DialogueTurnSnapshot,
+    pending_initial_reply: PendingInitialReply | None = None,
 ) -> None:
     def _worker() -> None:
         request_id = snapshot.request_id
         logger.info("memory retrieval background worker started request_id=%s", request_id)
+        retrieved_items: list[dict] = []
         try:
             _, retrieved_items = _run_retrieval(deps=deps, snapshot=snapshot)
             request_coordinator.mark_retrieval_completed(request_id, retrieved_items)
+            if pending_initial_reply is not None:
+                pending_initial_reply.mark_retrieval_completed()
             logger.info(
                 "memory retrieval background worker completed request_id=%s "
                 "retrieved_count=%d retrieved_ids=%s followup_auto_run=true",
@@ -820,8 +872,25 @@ def _run_retrieval_in_background(
             )
             return
 
+        followup_snapshot = snapshot
+        if pending_initial_reply is not None:
+            ready_snapshot = pending_initial_reply.wait(
+                timeout=FOLLOWUP_INITIAL_REPLY_WAIT_SECONDS,
+            )
+            if ready_snapshot is None:
+                logger.info(
+                    "followup background worker waiting for initial reply timed out "
+                    "request_id=%s wait_seconds=%.1f",
+                    request_id,
+                    FOLLOWUP_INITIAL_REPLY_WAIT_SECONDS,
+                )
+                return
+            followup_snapshot = ready_snapshot
+
         try:
-            _run_followup_decision(deps, request_id, snapshot=snapshot)
+            _run_followup_decision(deps, request_id, snapshot=followup_snapshot)
+            if pending_initial_reply is not None:
+                pending_initial_reply.mark_followup_completed()
         except Exception as exc:  # pragma: no cover - defensive background guard
             try:
                 request_coordinator.mark_followup_failed(
@@ -840,6 +909,9 @@ def _run_retrieval_in_background(
                 request_id,
                 str(exc) or exc.__class__.__name__,
             )
+        finally:
+            if pending_initial_reply is not None:
+                pending_initial_reply.mark_followup_completed()
 
     request_id = snapshot.request_id
     executor = _get_retrieval_executor(deps)

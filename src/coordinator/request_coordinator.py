@@ -132,10 +132,21 @@ def mark_initial_reply(
         raise ValueError("assistant_turn_id must be a string")
     with _store_lock:
         record = _require_request(request_id)
-        _ensure_can_advance_from(record, allowed={"received"})
+        _ensure_can_advance_from(
+            record,
+            allowed={
+                "received",
+                "retrieval_pending",
+                "retrieval_completed",
+                "retrieval_failed",
+            },
+        )
         record["initial_reply"] = reply
         record["initial_reply_turn_id"] = assistant_turn_id
-        _set_status(record, "initial_reply_generated")
+        if record["status"] == "received":
+            _set_status(record, "initial_reply_generated")
+        else:
+            record["updated_at"] = _utc_now_iso()
 
 
 def attach_context_snapshot(request_id: str, snapshot: dict) -> None:
@@ -155,7 +166,7 @@ def mark_retrieval_pending(request_id: str) -> None:
         record = _require_request(request_id)
         _ensure_can_advance_from(
             record,
-            allowed={"initial_reply_generated"},
+            allowed={"received", "initial_reply_generated"},
         )
         record["retrieval_status"] = "pending"
         record["retrieval_error"] = None
