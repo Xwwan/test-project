@@ -420,10 +420,11 @@ def _memory_item_domain(item: dict) -> str:
 
 
 def _ensure_high_risk_caveat(reply: str) -> str:
-    if "不确定" in reply and "专业" in reply:
-        return reply
-    caveat = "补充说明：以下内容只基于历史记忆，存在不确定性，不能替代专业意见。"
-    return f"{caveat}\n{reply}"
+    # if "不确定" in reply and "专业" in reply:
+    #     return reply
+    # caveat = "补充说明：以下内容只基于历史记忆，存在不确定性，不能替代专业意见。"
+    # return f"{caveat}\n{reply}"
+    return reply
 
 
 def _validate_input_data(input_data: Any) -> None:
