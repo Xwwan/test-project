@@ -10,6 +10,7 @@ import base64
 import inspect
 import io
 import json
+import sqlite3
 import tempfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -21,10 +22,12 @@ from unittest.mock import patch
 from src.audio.service import AudioDependencies
 from src.api.routes import ChatRequestHandler, build_app, dispatch
 from src.coordinator import request_coordinator
+from src.demo_profiles import reset_demo_profile
 from src.interaction import store as interaction_store
 from src.memory import db
 from src.services import DialogueDependencies, reset_followup_delivery_bus
 from src.services.onboarding_service import OnboardingDependencies
+from src.utils.config import load_app_config
 
 
 class FakeConversationStore:
@@ -125,6 +128,7 @@ class ApiRoutesTest(unittest.TestCase):
     def tearDown(self) -> None:
         request_coordinator.reset_store()
         reset_followup_delivery_bus()
+        reset_demo_profile()
         db.reset_database_path()
         self.temp_dir.cleanup()
 
@@ -219,6 +223,98 @@ class ApiRoutesTest(unittest.TestCase):
         assert body["input_mode"] == "text"
         assert body["tts_enabled"] is True
         assert body["interaction_session_id"].startswith("isess_")
+
+    def test_demo_profile_switches_runtime_database_and_data_dir(self) -> None:
+        demo_root = Path(self.temp_dir.name) / "latency-results"
+        self._create_demo_profiles(demo_root)
+        (demo_root / "jxl" / "app.db").chmod(0o400)
+
+        with patch("src.demo_profiles.DEFAULT_DEMO_ROOT", demo_root):
+            status, body = dispatch("POST", "/demo/profile", {"profile": "jxl"})
+
+        assert status == 200
+        runtime_dir = demo_root / "_active"
+        runtime_db = runtime_dir / "app.db"
+        source_db = demo_root / "jxl" / "app.db"
+        assert body["profile"] == "jxl"
+        assert body["active_profile"] == "jxl"
+        assert body["voice"] == "Serena"
+        assert body["tts_voice"] == "Serena"
+        assert body["database_path"] == str(runtime_db)
+        assert body["data_dir"] == str(runtime_dir)
+        assert body["source_data_dir"] == str(demo_root / "jxl")
+        assert body["runtime_data_dir"] == str(runtime_dir)
+        assert db.get_database_path() == runtime_db
+        assert runtime_db.stat().st_mode & 0o200
+        assert load_app_config()["audio"]["tts"]["voice"] == "Serena"
+
+        con = sqlite3.connect(runtime_db)
+        try:
+            tables = {
+                row[0]
+                for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        finally:
+            con.close()
+        assert "memory_items" in tables
+        assert "interaction_sessions" in tables
+        assert "onboarding_sessions" in tables
+
+        con = sqlite3.connect(source_db)
+        try:
+            source_tables = {
+                row[0]
+                for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        finally:
+            con.close()
+        assert "memory_items" not in source_tables
+        assert "interaction_sessions" not in source_tables
+        assert "onboarding_sessions" not in source_tables
+
+    def test_demo_profile_rejects_unknown_profile(self) -> None:
+        status, body = dispatch("POST", "/demo/profile", {"profile": "missing"})
+
+        assert status == 400
+        assert "profile must be one of" in body["error"]["message"]
+
+    def test_demo_profile_get_reports_available_profiles(self) -> None:
+        demo_root = Path(self.temp_dir.name) / "latency-results"
+        self._create_demo_profiles(demo_root)
+
+        with patch("src.demo_profiles.DEFAULT_DEMO_ROOT", demo_root):
+            status, body = dispatch("GET", "/demo/profile")
+
+        assert status == 200
+        assert [item["profile"] for item in body["available_profiles"]] == [
+            "jxl",
+            "normal",
+            "sts",
+        ]
+        assert all(item["exists"] for item in body["available_profiles"])
+        assert [item["tts_voice"] for item in body["available_profiles"]] == [
+            "Serena",
+            "Serena",
+            "Arthur",
+        ]
+
+    def _create_demo_profiles(self, demo_root: Path) -> None:
+        voices = {"jxl": "Serena", "normal": "Serena", "sts": "Arthur"}
+        for name in ("jxl", "normal", "sts"):
+            profile_dir = demo_root / name
+            profile_dir.mkdir(parents=True)
+            (profile_dir / "Model.md").write_text(f"model {name}", encoding="utf-8")
+            (profile_dir / "User.md").write_text(f"user {name}", encoding="utf-8")
+            (profile_dir / "app.local.yaml").write_text(
+                f"audio:\n  tts:\n    voice: {voices[name]}\n",
+                encoding="utf-8",
+            )
+            con = sqlite3.connect(profile_dir / "app.db")
+            con.close()
 
     def test_get_interaction_session_returns_status(self) -> None:
         created = interaction_store.create_session(
@@ -636,6 +732,7 @@ def _parse_sse_events(payload: str) -> list[dict[str, Any]]:
 
 class _FakeStreamHandler:
     _write_sse_event = ChatRequestHandler._write_sse_event
+    _write_common_headers = ChatRequestHandler._write_common_headers
 
     def __init__(
         self,

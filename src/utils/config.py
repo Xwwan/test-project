@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
+import threading
 from typing import Any
 
 import yaml
@@ -10,6 +12,26 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "app.yaml"
+_runtime_override_lock = threading.RLock()
+_runtime_config_overrides: dict[str, Any] = {}
+
+
+def set_runtime_config_overrides(overrides: dict[str, Any] | None) -> None:
+    """Set process-local config overrides applied after app.local.yaml."""
+
+    global _runtime_config_overrides
+    if overrides is None:
+        overrides = {}
+    if not isinstance(overrides, dict):
+        raise ValueError("runtime config overrides must be a mapping")
+    with _runtime_override_lock:
+        _runtime_config_overrides = deepcopy(overrides)
+
+
+def reset_runtime_config_overrides() -> None:
+    """Clear process-local config overrides."""
+
+    set_runtime_config_overrides({})
 
 
 def load_app_config(path: str | Path | None = None) -> dict[str, Any]:
@@ -26,6 +48,10 @@ def load_app_config(path: str | Path | None = None) -> dict[str, Any]:
     if local_path.exists():
         local = _load_yaml_mapping(local_path, label="local config")
         loaded = _deep_merge(loaded, local)
+    with _runtime_override_lock:
+        runtime_overrides = deepcopy(_runtime_config_overrides)
+    if runtime_overrides:
+        loaded = _deep_merge(loaded, runtime_overrides)
     return loaded
 
 

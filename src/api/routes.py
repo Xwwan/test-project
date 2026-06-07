@@ -52,6 +52,11 @@ from src.audio.service import (
     handle_voice_chat,
     handle_voice_reply_from_text,
 )
+from src.demo_profiles import (
+    DemoProfileError,
+    get_demo_profile_state,
+    switch_demo_profile,
+)
 from src.services import (
     DialogueDependencies,
     curate_conversation_memory,
@@ -192,9 +197,15 @@ def dispatch(
             return _post_memory_curate(body, dependencies)
         if method == "POST" and pure_path == "/memory/profile/refresh":
             return _post_memory_profile_refresh(dependencies)
+        if method == "GET" and pure_path == "/demo/profile":
+            return _get_demo_profile()
+        if method == "POST" and pure_path == "/demo/profile":
+            return _post_demo_profile(body)
         if method == "GET" and pure_path == "/healthz":
             return 200, {"status": "ok"}
     except SchemaError as exc:
+        return _error(400, str(exc))
+    except DemoProfileError as exc:
         return _error(400, str(exc))
     except (ValueError, TypeError) as exc:
         return _error(400, str(exc))
@@ -726,6 +737,17 @@ def _post_memory_profile_refresh(
     return 200, response.to_dict()
 
 
+def _get_demo_profile() -> JSONResponse:
+    return 200, get_demo_profile_state()
+
+
+def _post_demo_profile(body: Any) -> JSONResponse:
+    if not isinstance(body, dict):
+        raise DemoProfileError("request body must be an object")
+    profile = body.get("profile")
+    return 200, switch_demo_profile(profile)
+
+
 def _error(status: int, message: str) -> JSONResponse:
     return status, {"error": {"message": message}}
 
@@ -1107,6 +1129,11 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - http.server naming
         self._handle("POST")
 
+    def do_OPTIONS(self) -> None:  # noqa: N802 - http.server naming
+        self.send_response(204)
+        self._write_common_headers()
+        self.end_headers()
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - http.server signature
         # Quieter logging that respects ``--quiet`` style usage. Callers can
         # subclass and override if they want detailed access logs.
@@ -1160,6 +1187,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
+        self._write_common_headers()
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
@@ -1200,6 +1228,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
+        self._write_common_headers()
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
@@ -1257,6 +1286,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
+        self._write_common_headers()
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
@@ -1296,6 +1326,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
+        self._write_common_headers()
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
@@ -1358,6 +1389,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
+        self._write_common_headers()
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
@@ -1384,6 +1416,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
+        self._write_common_headers()
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
@@ -1419,6 +1452,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
     def _write_json(self, status: int, body: dict) -> None:
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        self._write_common_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -1437,10 +1471,16 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             self._write_json(404, {"error": {"message": "static page not found"}})
             return
         self.send_response(200)
+        self._write_common_headers()
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _write_common_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
 
 _BODY_ERROR = object()
